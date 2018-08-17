@@ -1,0 +1,782 @@
+########################################################################################################################################
+#pre_processing_alignment_and_variant_calling_command_lines.pl
+########################################################################################################################################
+
+=head
+DESCRIPTION: taking as input one or more directories of paired-end fastq files (one directory per sample, of format, e.g. "sample1/sample1.1.fq.gz" and "sample1/sample1.2.fq.gz"), this Perl script will output a shell script containing all commands necessary to pre-process these reads, align them to a reference genome, call variants per sample and, finally, to merge all variant call sets into one gVCF (genomic variant call file).
+
+DISCLAIMER: the following should be considered "lab-ready" code and is provided for reproducibility purposes only. No attempt has been made to optimise the code or to test it upon other datasets. The software versions used are detailed below; note the associated command lines are subject to change should the software be upgraded.
+
+PREREQUISITES: prior to use, the following prequisites must be met:
+1. Two tools must be accessible from the command line: (a) bwa v0.7.8 (http://bio-bwa.sourceforge.net/), and (b) samtools v1.3 (http://samtools.sourceforge.net/).
+2. Paths to the JAR files for Trimmomatic v0.35 (http://www.usadellab.org/cms/?page=trimmomatic), GATK v3.5 (https://software.broadinstitute.org/gatk/download/), and Picard Tools v2.1.1 (https://broadinstitute.github.io/picard/) must be hard-coded (see the section of script marked 'requirements', below).
+3. Both an indexed reference genome (Amel_4.5) and a set of known SNPs (from dbSNP build 140) must be provided for use with GATK. These paths are hard-coded as the variables $ref_genome and $known_bee_snps, respectively (see the section of script marked 'requirements', below).
+
+## obtain the A. mellifera reference genome. This must then be indexed both with SAMtools faidx (necessary for compatibility with GATK) and BWA (necessary for alignment). Also necessary for compatibility with GATK is a 'dictionary' file, created using Picard Tools. Note the output files from the indexing steps must remain in the same directory, and have the same root name, as the reference genome .fa file.
+mkdir am_genome
+cd am_genome
+curl -O -L ftp://ftp.ensemblgenomes.org/pub/metazoa/release-30/fasta/apis_mellifera/dna/Apis_mellifera.GCA_000002195.1.30.dna.toplevel.fa.gz
+gunzip Apis_mellifera.GCA_000002195.1.30.dna.toplevel.fa.gz
+bwa index Apis_mellifera.GCA_000002195.1.30.dna.toplevel.fa
+samtools faidx Apis_mellifera.GCA_000002195.1.30.dna.toplevel.fa
+java -jar picard.jar CreateSequenceDictionary REFERENCE=Apis_mellifera.GCA_000002195.1.30.dna.toplevel.fa OUTPUT=Apis_mellifera.GCA_000002195.1.30.dna.toplevel.dict
+
+## obtain the set of known bee SNPs from NCBI dbSNP. These comprise a set of VCFs (one per chromosome/contig/scaffold), which we shall merge into a single file - "bee_dbsnp_snps.vcf" - using GATK CombineVariants
+mkdir bee_snps
+cd bee_snps
+wget -r --no-parent ftp://ftp.ncbi.nlm.nih.gov/snp/organisms/archive/bee_7460/VCF/
+cd ftp.ncbi.nlm.nih.gov/snp/organisms/archive/bee_7460/VCF/
+gunzip *.gz # this error will happen if you don't unzip these files: http://gatkforums.broadinstitute.org/gatk/discussion/5349/genotypegvcfs-warn-track-variant-doesnt-have-a-sequence-dictionary-built-in
+# at this point, we must pay attention to what the chromosome/contig names in each VCF are considered to be - they are 'LG1', 'LG2' etc., inconsistent with those given in the reference genome .fa (ignoring the many contig/scaffold IDs in the .fa, the chromosome names here are purely numeric: 1, 2, 3, etc. To see this for yourself, use "grep '>', am_genome/Apis_mellifera.GCA_000002195.1.30.dna.toplevel.fa"). This discrepancy can be rectified manually by renaming the chromosome IDs in each VCF, 'LG1' to '1', and so on. Delete the now-obsolete indices for each of the original VCFs before proceeding (GATK will automatically create an index should one be missing anyway).
+java -jar GenomeAnalysisTK.jar -T CombineVariants -R am_genome/Apis_mellifera.GCA_000002195.1.30.dna.toplevel.fa -o bee_dbsnp_snps.vcf --variant vcf_chr_LG1.vcf --variant vcf_chr_LG2.vcf --variant vcf_chr_LG3.vcf --variant vcf_chr_LG4.vcf --variant vcf_chr_LG5.vcf --variant vcf_chr_LG6.vcf --variant vcf_chr_LG7.vcf --variant vcf_chr_LG8.vcf --variant vcf_chr_LG9.vcf --variant vcf_chr_LG10.vcf --variant vcf_chr_LG11.vcf --variant vcf_chr_LG12.vcf --variant vcf_chr_LG13.vcf --variant vcf_chr_LG14.vcf --variant vcf_chr_LG15.vcf --variant vcf_chr_LG16.vcf
+=cut
+
+use strict;
+use warnings;
+
+# REQUIREMENTS
+my $gatk_path 		 = 'GenomeAnalysisTK.jar'; # available from https://software.broadinstitute.org/gatk/download/auth?package=GATK-archive&version=3.5-0-g36282e4
+my $picard_path		 = 'picard.jar'; # available from https://github.com/broadinstitute/picard/releases/download/2.1.1/picard-tools-2.1.1.zip
+my $trimmomatic_path = 'trimmomatic-0.35.jar'; # available from http://www.usadellab.org/cms/uploads/supplementary/Trimmomatic/Trimmomatic-0.35.zip
+my $ref_genome		 = 'am_genome/Apis_mellifera.GCA_000002195.1.30.dna.toplevel.fa'; # available from ftp://ftp.ensemblgenomes.org/pub/metazoa/release-30/fasta/apis_mellifera/dna/Apis_mellifera.GCA_000002195.1.30.dna.toplevel.fa.gz
+my $known_bee_snps	 = 'bee_dbsnp_snps.vcf'; # available by combining the content of ftp://ftp.ncbi.nlm.nih.gov/snp/organisms/archive/bee_7460/VCF/ (see above)
+my $raw_reads_dir 	 = 'raw_reads'; # this directory should contain numerous subdirectories, one per sample, that each contain paired-end .fq.gz files
+
+# OUTPUT
+my $shell_script = 'script.sh';
+open(OUT,'>',$shell_script) or die $!;
+print OUT "#!/bin/bash\n";
+my $cleaned_reads_dir = 'cleaned_reads';
+my $alignments_dir 	  = 'aligned_cleaned_reads';
+my $assembly_dir	  = 'assembled_reads';
+my $var_call_dir	  = 'variant_calling';
+print OUT "mkdir $cleaned_reads_dir\n" unless (-d($cleaned_reads_dir));
+print OUT "mkdir $alignments_dir\n" unless (-d($alignments_dir));
+print OUT "mkdir $var_call_dir\n" unless (-d($var_call_dir));
+
+opendir(DIR,$raw_reads_dir) or die $!;
+my @subdirs = readdir(DIR);
+closedir(DIR) or die $!;
+my $sample_num = 0;
+my @bam_files_for_variant_calling = ();
+foreach my $sample_id (@subdirs)
+	{ next if (($sample_id eq '.') or ($sample_id eq '..'));
+	  $sample_num++;
+	  opendir(DIR,"$raw_reads_dir/$sample_id") or die $!;
+	  my @fastq_files = readdir(DIR);
+	  closedir(DIR) or die $!;
+	  
+	  # 1. CLEAN ALL READS
+	  my %ids_seen = ();
+	  foreach my $fastq_file (@fastq_files)
+		{ next if (($fastq_file eq '.') or ($fastq_file eq '..'));
+		  next if ($fastq_file !~ /^(.*?)\_\d+\.fq\.gz$/);
+		  my $fastq_id = $1;
+		  next if (exists($ids_seen{$fastq_id}));
+		  my $raw_read_id_file1 = "$raw_reads_dir/$sample_id/$fastq_id.1.fq.gz";
+		  my $raw_read_id_file2 = "$raw_reads_dir/$sample_id/$fastq_id.2.fq.gz";
+		  my $processed_read_id_file1 = "$cleaned_reads_dir/$fastq_id.forward_paired.fq.gz";
+		  my $processed_read_id_file2 = "$cleaned_reads_dir/$fastq_id.forward_unpaired.fq.gz";
+		  my $processed_read_id_file3 = "$cleaned_reads_dir/$fastq_id.reverse_paired.fq.gz";
+		  my $processed_read_id_file4 = "$cleaned_reads_dir/$fastq_id.reverse_unpaired.fq.gz";
+		  print OUT "java -jar $trimmomatic_path PE -phred33 $raw_read_id_file1 $raw_read_id_file2 $processed_read_id_file1 $processed_read_id_file2 $processed_read_id_file3 $processed_read_id_file4 TRAILING:20 SLIDINGWINDOW:4:20 MINLEN:100\n";
+		  $ids_seen{$fastq_id}++;
+		}
+	  
+	  # 2. ALIGN ALL READS TO THE REFERENCE GENOME, CREATING BAM FILES WHICH WE'LL LATER POST-PROCESS (PARTITIONING OFF UNMAPPED READS; PREPARING THE REMAINDER FOR GATK, ETC.)
+	  my $merge_line = '';
+	  while((my $file_root,my $irrel)=each(%ids_seen))
+		{ my $fwd_paired   = "$cleaned_reads_dir/$file_root.forward_paired.fq.gz";
+		  my $rev_paired   = "$cleaned_reads_dir/$file_root.reverse_paired.fq.gz";
+		  my $fwd_unpaired = "$cleaned_reads_dir/$file_root.forward_unpaired.fq.gz";
+		  my $rev_unpaired = "$cleaned_reads_dir/$file_root.reverse_unpaired.fq.gz";
+		  my $unpaired     = "$cleaned_reads_dir/$file_root.unpaired.fq";
+		  print OUT "zcat $fwd_unpaired $rev_unpaired > $unpaired\n";
+		  print OUT "rm $fwd_unpaired $rev_unpaired\n";
+		  my $bam_paired   = "$alignments_dir/$file_root.paired.bam";
+		  my $bam_unpaired = "$alignments_dir/$file_root.unpaired.bam";
+		  print OUT "bwa mem -R '@RG\tID:group$sample_num\tSM:sample$sample_num\tPL:Illumina\tLIB:lib$sample_num\tPU:unit$sample_num' -M $ref_genome $fwd_paired $rev_paired | samtools view -Sbh - > $bam_paired\n";
+		  print OUT "bwa mem -R '@RG\tID:group$sample_num\tSM:sample$sample_num\tPL:Illumina\tLIB:lib$sample_num\tPU:unit$sample_num' -M $ref_genome $unpaired | samtools view -Sbh - > $bam_unpaired\n";
+		  $merge_line .= "INPUT=$bam_paired INPUT=$bam_unpaired ";
+		  print OUT "rm $fwd_paired $rev_paired\n";
+		}
+	  my $bam_merged   = "$alignments_dir/$sample_num.bam";
+	  print OUT "java -jar $picard_path MergeSamFiles $merge_line OUTPUT=$bam_merged TMP_DIR=$alignments_dir\n";
+	  my $bam_mapped   = "$alignments_dir/$sample_num.mapped.bam";
+	  my $bam_unmapped = "$alignments_dir/$sample_num.unmapped.bam";
+	  print OUT "samtools view -b -F 12 -q 20 $bam_merged > $bam_mapped\n";
+	  my $bam_mapped_sorted = "$alignments_dir/$sample_num.mapped.sorted.bam";
+	  print OUT "java -jar $picard_path SortSam INPUT=$bam_mapped OUTPUT=$bam_mapped_sorted TMP_DIR=$alignments_dir\n";
+	  print OUT "rm $bam_mapped\n";
+	  my $bam_mapped_sorted_deduped = "$alignments_dir/$sample_num.mapped.sorted.deduped.bam";
+	  my $metrics_file = "$alignments_dir/$sample_num.mapped.sorted.deduped.metrics";
+	  print OUT "java -jar $picard_path MarkDuplicates INPUT=$bam_mapped_sorted OUTPUT=$bam_mapped_sorted_deduped METRICS_FILE=$metrics_file ASSUME_SORTED=true\n";
+	  print OUT "rm $bam_mapped_sorted\n";
+	  print OUT "rm $metrics_file\n";
+	  print OUT "java -jar $picard_path BuildBamIndex INPUT=$bam_mapped_sorted_deduped\n";
+	  push(@bam_files_for_variant_calling,$bam_mapped_sorted_deduped);
+	}
+	
+# 3. VARIANT CALLING, PART 1: PER-SAMPLE COMMANDS
+my $vcfs_for_merging = '';
+foreach my $bam (@bam_files_for_variant_calling)
+	{ my $sample_num;
+	  if ($bam =~ /^.*?\/(\d+)\.mapped\.sorted\.deduped\.bam$/) { $sample_num = $1; }
+	  my $intervals_list = "$var_call_dir/$sample_num.intervals.list";
+	  print OUT "java -jar $gatk_path -T RealignerTargetCreator -R $ref_genome -I $bam -o $intervals_list\n"; # DETERMINE 'SUSPICIOUS' INTERVALS IN NEED OF LOCAL REALIGNMENT AROUND INDELS
+	  my $realigned_bam = "$var_call_dir/$sample_num.realigned.bam";
+	  print OUT "java -jar $gatk_path -T IndelRealigner -R $ref_genome -I $bam -targetIntervals $intervals_list -o $realigned_bam\n"; # LOCALLY REALIGN BAM FILES TO CORRECT FOR MISMATCHING BASES THAT COULD OTHERWISE BE MISTAKEN FOR SNPs (CAUSED BY INDELS IN THE GNEOME THAT ARE ABSENT FROM THE REFERENCE)
+	  print OUT "rm $intervals_list\n";
+	  my $recal_table = "$var_call_dir/$sample_num.recal.data.table";
+	  print OUT "java -jar $gatk_path -T BaseRecalibrator -R $ref_genome -I $realigned_bam -knownSites $known_bee_snps -o $recal_table\n"; # RECALIBRATE BASE QUALITY SCORES USING THE SET OF dbSNP SNPs (SO AS TO ENSURE THE RECALIBRATED SCORES ARE MORE ACCURATE IN THAT THEY'RE CLOSER TO THE ACTUAL PROBABILITY OF MISMATCHING THE REFERENCE GENOME)
+	  my $realigned_recalibrated_bam = "$var_call_dir/$sample_num.realigned.recalibrated.bam";
+	  print OUT "java -jar $gatk_path -T PrintReads -R $ref_genome -I $realigned_bam -BQSR $recal_table -o $realigned_recalibrated_bam\n"; # APPLY THE RECALIBRATED BASE QUALITY SCORES TO THE SEQUENCE DATA
+	  print OUT "rm $realigned_bam\n";
+	  print OUT "rm $recal_table\n";
+	  my $realigned_recalibrated_vcf = "$var_call_dir/$sample_num.realigned.recalibrated.vcf";
+	  print OUT "java -jar $gatk_path -T HaplotypeCaller -R $ref_genome -I $realigned_recalibrated_bam --emitRefConfidence GVCF --variant_index_type LINEAR --variant_index_parameter 128000 -o $realigned_recalibrated_vcf\n"; # CALL VARIANTS FOR EACH SAMPLE INDIVIDUALLY, PRODUCING A VCF (VARIANT CALL FILE)
+	  print OUT "rm $realigned_recalibrated_bam\n";
+	  $vcfs_for_merging .= "--variant $realigned_recalibrated_vcf ";
+	}
+
+# 4. VARIANT CALLING, PART 2: ALL-SAMPLE COMMANDS
+my $variants_vcf = "$var_call_dir/variants.vcf";
+print OUT "java -jar $gatk_path -T GenotypeGVCFs -R $ref_genome $vcfs_for_merging --max_alternate_alleles 12 -o $variants_vcf\n"; # MERGE THE VCFs OF ALL SAMPLES, SO AS TO CALL VARIANTS ACROSS ALL SAMPLES SIMULTANEOUSLY
+my $variants_vcf2 = "$var_call_dir/variants2.vcf";
+print OUT "java -jar $gatk_path -T VariantAnnotator -R $ref_genome --dbsnp $known_bee_snps --variant $variants_vcf -o $variants_vcf2 -A QualByDepth -A MappingQualityRankSumTest -A MappingQualityZero -A ReadPosRankSumTest -A FisherStrand -A ClippingRankSumTest -A DepthPerAlleleBySample\n"; # INCORPORATE NECESSARY ANNOTATIONS FOR A VARIANT RECALIBRATION MODELS (AND ADD IN KNOWN BEE SNP IDs, i.e. rsIDs, TOO)
+print OUT "rm $variants_vcf\n";
+my $recal_file = "$var_call_dir/variants.recal";
+my $tranches_file = "$var_call_dir/variants.tranches";
+print OUT "java -jar $gatk_path -T VariantRecalibrator -R $ref_genome -input $variants_vcf2 -resource:ensembl,known=false,training=true,truth=false,prior=12.0 $known_bee_snps -resource:dbsnp,known=false,training=true,truth=true,prior=15.0 $known_bee_snps -an QD -an MQ -an MQRankSum -an ReadPosRankSum -an FS -an DP -mode SNP -badLodCutoff -3 -recalFile $recal_file -tranchesFiles $tranches_file\n"; # RECALIBRATE VARIANT QUALITY SCORES FOR EACH SNP, WITH dbSNP AS BOTH THE 'TRUTH' SET AND 'TRAINING' SET (THESE ARE LISTS OF SITES FOR WHICH A PRIOR PROBABILITY OF BEING CORRECT HAS BEEN APPLIED, BUT WHICH AREN'T USED BY THE GATK ALGORITHM ITSELF - 'TRAINING' SITES ARE USED TO BUILD A RECALIBRATION MODEL USING INPUT VARIANTS THAT OVERLAP WITH THEM; 'TRUTH' SITES ARE USED TO DETERMINE WHERE TO SET A SENSITIVITY CUTOFF)
+my $variants_vqsr_vcf = "$var_call_dir/variants.vqsr.vcf";
+print OUT "java -jar $gatk_path -T ApplyRecalibration -R $ref_genome -input $variants_vcf2 --ts_filter_level 99.0 -mode SNP -recalFile $recal_file -tranchesFile $tranches_file -o $variants_vqsr_vcf\n"; # APPLY THE RECALIBRATED VARIANT QUALITY SCORES TO THE DATA, CREATING A FILTERED VCF (HERE NAMED 'VQSR', i.e. VARIANT QUALITY SCORE RECALIBRATION)
+print OUT "rm $recal_file $tranches_file $variants_vcf2\n";
+
+close(OUT) or die $!;
+exit 1;
+
+########################################################################################################################################
+Make_a_distance_matrix_from_gvcf.r
+########################################################################################################################################
+## Script purpose: Make a distance matrix from an Identity By State analysis of multiple VCFs. This allows for generation of a network graph comparing sample to sample based on reference genomw alignment.
+## Date: January 2018
+## Author: Tim Regan
+
+#Firstly, the VCF needs to be reduced to chromosomes (autosomames in this case) which need to be named by number.
+#We called this "variants.vqsr.chr_renamed.vcf"
+#The resulting matrix can be used to construct a network graph.
+#setwd() to working directory
+#install.packages("SNPRelate")
+#source("https://bioconductor.org/biocLite.R")
+#biocLite("SNPRelate")
+
+library(SNPRelate)
+
+vcf.fn<- readline("What and where is your variants.vqsr.chr_renamed.vcf please?")
+
+snpgdsVCF2GDS(vcf.fn, "ccm.gds", method="biallelic.only")
+
+genofile <- snpgdsOpen("ccm.gds")
+#ccm_pca<-snpgdsPCA(genofile)
+
+samples_used <- readline("Which samples are you interested in? Use quotes for each and separate with a comma.")
+
+ibs_objects <- snpgdsIBS(genofile, sample.id=c(samples_used), snp.id = NULL, autosome.only = TRUE, remove.monosnp = TRUE, maf = NaN, missing.rate = NaN, num.thread = 1, verbose = TRUE)
+
+ibs<-ibs_objects$ibs
+names<-bee_matrix$sample.id
+
+matrixfile <- readline("What would you like your matrix file to be called?")
+
+write.table(newfile, file = matrixfile, sep = "\t", row.names=names, col.names=NA)
+
+
+########################################################################################################################################
+Contig_filter_len.cov.py
+########################################################################################################################################
+#!/usr/bin/env python
+import sys
+from Bio import SeqIO
+import re
+
+cov_pattern = re.compile("cov_([0-9.]+)")
+
+min_length, min_coverage, fasta_file_path = sys.argv[1:]
+
+with open(fasta_file_path.replace('fasta', 'fltr.fasta'), 'w') as filtered_fasta:
+	with open(fasta_file_path, 'rU') as input_fasta:
+		def filtered_contigs_generator(minl, minc):
+			for contig in SeqIO.parse(input_fasta, 'fasta'):
+				result = cov_pattern.search(contig.name)
+				if result:
+					if len(contig) >= minl and float(result.group(1)) >= minc:
+						yield contig
+		SeqIO.write(filtered_contigs_generator(int(min_length), float(min_coverage)), filtered_fasta, 'fasta')
+
+
+########################################################################################################################################
+De novo assembly of non-host reference reads, calculation of base coverage of the resulting contigs for each sample.
+########################################################################################################################################
+
+#!/bin/bash
+
+#########################################################################################################
+
+#Begin in this directory: <home>
+#Requirement: Must have this python script in this directory: "Contig_filter_len.cov.py"
+#Leftover reads following host ref assembly = Reads form each sample are concatenated keeping 1st, 2nd pairs and unpaired together (3 .fq files from 23 samples). Here called combined.1.fq combined.2.fq combined.unpaired.fq 
+#Original leftover reads located here: "<sample_name>.<1_or_2_or_unpaired>.fq"
+#Cutoff for contigs are set at length 1000 bp and coverage of 2.
+
+#########################################################################################################
+##Add the following modules:
+# module add apps/gcc/bwa/0.7.8
+# module add apps/gcc/samtools/1.2
+# module add compilers/java/1.8.0_60 # for Picard
+# module add compilers/python/2.7.9 # for Blobtools
+# module add apps/gcc/SPAdes/3.8.1
+# module load apps/gcc/samtools/1.4
+
+##5 rounds of assembly
+
+#iteration1
+cd <home>
+mkdir iteration1
+spades.py --meta -t 96 -1 combined.1.fq -2 combined.2.fq -s combined.unpaired.fq -o <home>/iteration1
+python Contig_filter_len.cov.py 1000 2 iteration1/scaffolds.fasta
+
+bwa index -a bwtsw iteration1/scaffolds.fltr.fasta
+bwa mem -M -t 96 iteration1/scaffolds.fltr.fasta combined.unpaired.fq | samtools view -bh - | samtools sort - iteration1/it1.unpaired
+bwa mem -M -t 96 iteration1/scaffolds.fltr.fasta combined.1.fq combined.2.fq| samtools view -bh - | samtools sort - iteration1/it1.paired
+java -jar picard-tools-1.138/picard.jar MergeSamFiles SORT_ORDER='coordinate' OUTPUT= iteration1/it1.bam INPUT=iteration1/it1.paired.bam INPUT=iteration1/it1.unpaired.bam
+rm iteration1/it1.unpaired.bam iteration1/it1.paired.bam 
+samtools view -h -b -f 4 iteration1/it1.bam > iteration1/it1.unmapped.bam
+java -jar picard-tools-1.138/picard.jar SamToFastq INPUT=iteration1/it1.unmapped.bam FASTQ=iteration1/it1.unmapped.1.fq SECOND_END_FASTQ=iteration1/it1.unmapped.2.fq UNPAIRED_FASTQ=iteration1/it1.unmapped.unpaired.fq
+rm iteration1/it1.bam iteration1/it1.unmapped.bam
+gzip *.fq 
+
+#iteration2
+mkdir iteration2
+spades.py --meta -t 96 -1 iteration1/it1.unmapped.1.fq -2 iteration1/it1.unmapped.2.fq -s iteration1/it1.unmapped.unpaired.fq -o <home>/iteration2
+python Contig_filter_len.cov.py 1000 2 iteration2/scaffolds.fasta
+
+bwa index -a bwtsw iteration2/scaffolds.fltr.fasta
+bwa mem -M -t 96 iteration2/scaffolds.fltr.fasta iteration1/it1.unmapped.unpaired.fq | samtools view -bh - | samtools sort - iteration2/it2.unpaired
+bwa mem -M -t 96 iteration2/scaffolds.fltr.fasta iteration1/it1.unmapped.1.fq iteration1/it1.unmapped.2.fq| samtools view -bh - | samtools sort - iteration2/it2.paired
+java -jar picard-tools-1.138/picard.jar MergeSamFiles SORT_ORDER='coordinate' OUTPUT= iteration2/it2.bam INPUT=iteration2/it2.paired.bam INPUT=iteration2/it2.unpaired.bam
+rm iteration2/it2.unpaired.bam iteration2/it2.paired.bam 
+samtools view -h -b -f 4 iteration2/it2.bam > iteration2/it2.unmapped.bam
+java -jar picard-tools-1.138/picard.jar SamToFastq INPUT=iteration2/it2.unmapped.bam FASTQ=iteration2/it2.unmapped.1.fq SECOND_END_FASTQ=iteration2/it2.unmapped.2.fq UNPAIRED_FASTQ=iteration2/it2.unmapped.unpaired.fq
+rm iteration2/it2.bam iteration2/it2.unmapped.bam
+gzip iteration1/*.fq
+
+#iteration3
+mkdir iteration3
+spades.py --meta -t 96 -1 iteration2/it2.unmapped.1.fq -2 iteration2/it2.unmapped.2.fq -s iteration2/it2.unmapped.unpaired.fq -o <home>/iteration3
+python Contig_filter_len.cov.py 1000 2 iteration3/scaffolds.fasta
+
+bwa index -a bwtsw iteration3/scaffolds.fltr.fasta
+bwa mem -M -t 96 iteration3/scaffolds.fltr.fasta iteration2/it2.unmapped.unpaired.fq | samtools view -bh - | samtools sort - iteration3/it3.unpaired
+bwa mem -M -t 96 iteration3/scaffolds.fltr.fasta iteration2/it2.unmapped.1.fq iteration2/it2.unmapped.2.fq| samtools view -bh - | samtools sort - iteration3/it3.paired
+java -jar picard-tools-1.138/picard.jar MergeSamFiles SORT_ORDER='coordinate' OUTPUT= iteration3/it3.bam INPUT=iteration3/it3.paired.bam INPUT=iteration3/it3.unpaired.bam
+rm iteration3/it3.unpaired.bam iteration3/it3.paired.bam 
+samtools view -h -b -f 4 iteration3/it3.bam > iteration3/it3.unmapped.bam
+java -jar picard-tools-1.138/picard.jar SamToFastq INPUT=iteration3/it3.unmapped.bam FASTQ=iteration3/it3.unmapped.1.fq SECOND_END_FASTQ=iteration3/it3.unmapped.2.fq UNPAIRED_FASTQ=iteration3/it3.unmapped.unpaired.fq
+rm iteration3/it3.bam iteration3/it3.unmapped.bam
+gzip iteration2/*.fq 
+
+#iteration4
+mkdir iteration4
+cd iteration3
+spades.py --careful -t 40 -s it3.unmapped.unpaired.fq -o <home>/iteration4
+cd ..
+python Contig_filter_len.cov.py 1000 2 iteration4/scaffolds.fasta
+
+bwa index -a bwtsw iteration4/scaffolds.fltr.fasta
+bwa mem -M -t 40 iteration4/scaffolds.fltr.fasta iteration3/it3.unmapped.unpaired.fq | samtools view -bh - | samtools sort - iteration4/it4.unpaired
+java -jar picard-tools-1.138/picard.jar MergeSamFiles SORT_ORDER='coordinate' OUTPUT=iteration4/it4.bam INPUT=iteration4/it4.unpaired.bam
+rm iteration4/unpaired.bam iteration4/paired.bam 
+samtools view -h -b -f 4 iteration4/it4.bam > iteration4/it4.unmapped.bam
+java -jar picard-tools-1.138/picard.jar SamToFastq INPUT=iteration4/it4.unmapped.bam FASTQ=iteration4/it4.unmapped.1.fq SECOND_END_FASTQ=iteration4/it4.unmapped.2.fq UNPAIRED_FASTQ=iteration4/it4.unmapped.unpaired.fq
+rm iteration4/it4.bam iteration4/it4.unmapped.bam
+gzip iteration3/*.fq
+
+#iteration5
+mkdir iteration5
+cd iteration4
+spades.py --careful -t 40 -s it4.unmapped.unpaired.fq -o <home>/iteration5
+cd ..
+python Contig_filter_len.cov.py 1000 2 iteration5/scaffolds.fasta
+
+bwa index -a bwtsw iteration5/scaffolds.fltr.fasta
+bwa mem -M -t 40 iteration5/scaffolds.fltr.fasta iteration4/it4.unmapped.unpaired.fq | samtools view -bh - | samtools sort - iteration5/it5.unpaired
+java -jar picard-tools-1.138/picard.jar MergeSamFiles SORT_ORDER='coordinate' OUTPUT=iteration5/it5.bam INPUT=iteration5/it5.unpaired.bam
+rm iteration5/unpaired.bam iteration5/paired.bam 
+samtools view -h -b -f 4 iteration5/it5.bam > iteration5/it5.unmapped.bam
+java -jar picard-tools-1.138/picard.jar SamToFastq INPUT=iteration5/it5.unmapped.bam FASTQ=iteration5/it5.unmapped.1.fq SECOND_END_FASTQ=iteration5/it5.unmapped.2.fq UNPAIRED_FASTQ=iteration5/it5.unmapped.unpaired.fq
+rm iteration5/it5.bam iteration5/it5.unmapped.bam
+gzip iteration4/*.fq
+gzip iteration5/*.fq
+
+###########################################################################################################################
+#After 5 iterations the assembly is complete. Now we combine assemblies, and align reads from each sample to these contigs.
+###########################################################################################################################
+
+mkdir Samples_aligned
+cat */*fltr.fasta > Samples_aligned/All_contigs.fasta
+bwa index -a bwtsw Samples_aligned/All_contigs.fasta
+cd Samples_aligned
+
+#Each sample name is located in: <Sample_names_list>
+#We now align original leftover reads to the assembled contigs
+#idxstats from samtools gives mapped reads/contig in 3rd column (unmapped in 4th, 1st is name, 2nd is length of contig)
+
+for i in `cat <Sample_names_list> | awk {'print $1'}`; do
+	mkdir $i
+	bwa mem -M -t 96 All_contigs.fasta ../../../Unmapped_post_alignment/$i.unpaired.fq | samtools view -bh - | samtools sort - $i/unpaired
+	bwa mem -M -t 96 All_contigs.fasta ../../../Unmapped_post_alignment/$i.1.fq ../../../Unmapped_post_alignment/$i.2.fq | samtools view -bh - | samtools sort - $i/paired
+	java -jar picard-tools-1.138/picard.jar MergeSamFiles SORT_ORDER='coordinate' OUTPUT= $i/$i.bam INPUT=$i/paired.bam INPUT=$i/unpaired.bam
+	samtools index $i/$i.bam
+	samtools idxstats $i/$i.bam | sort -k 1 > $i/$i.reads.txt
+done
+
+####################################################
+##Open Blobtools##
+####################################################
+cd blobtools/
+source bin/activate
+
+#For each sample, get a bam2cov for base coverage etc.
+#Needs Samtools
+
+for i in `cat <Sample_names_list> | awk {'print $1'}`; do
+	./blobtools map2cov -i <home>/Samples_aligned/All_contigs.fasta -b <home>/Samples_aligned/$i/$i.bam -o <home>/Samples_aligned/$i/
+done
+#done for individual samples, now for all samples together
+cd <home>/Samples_aligned
+gunzip ../*.gz
+
+bwa mem -M -t 96 All_contigs.fasta ../combined.unpaired.fq | samtools view -bh - | samtools sort - ../unpaired
+bwa mem -M -t 96 All_contigs.fasta ../combined.1.fq ../combined.2.fq | samtools view -bh - | samtools sort - ../paired
+java -jar picard-tools-1.138/picard.jar MergeSamFiles SORT_ORDER='coordinate' OUTPUT= ../combined.bam INPUT=../paired.bam INPUT=../unpaired.bam
+rm ../paired.bam ../unpaired.bam
+
+cd blobtools/
+source bin/activate
+
+./blobtools map2cov -i <home>/Samples_aligned/All_contigs.fasta -b <home>/Samples_aligned/combined.bam -o <home>/
+
+cd <home>/Samples_aligned
+
+#Now take base cov from each sample/contig and paste together in a table
+#Required python file Base_cov.py
+for i in `cat <Sample_names_list> | awk {'print $1'}`; do sort $i/*.cov -k 1 > $i/sorted.cov; done
+for i in `cat <Sample_names_list> | awk {'print $1'}`; do python Base_cov.py $i $i/sorted.cov $i/$i.base_score.txt; done
+
+paste Contigs.txt */*base_score.txt > Basecov_per_contig.txt
+
+
+
+
+########################################################################################################################################
+"Taxify" contigs based on custom databases
+########################################################################################################################################
+# these two approaches do not work
+    - blastdb_aliastool: make individual blastdb with taxid and creating alias
+    - makeblastdb with taxid_map file
+
+# solution
+    - Make taxid_map file (check that IDs are unique)
+    - BLAST
+    - annotate BLAST results with taxid_map
+
+sed ''
+# make long headers for later identidying things manually
+sed -r '/^[>].*/{s/[^-[:alnum:]._> ]//g}' FILE | sed 's/ /_/g' |
+
+cat Apis_mellifera_filamentous_virus.1100043.protein.faa | sed -r '/^[>].*/{s/[^-[:alnum:]._> ]//g}' | sed 's/ /_/g' > Apis_mellifera_filamentous_virus.1100043.protein.sane.faa ; \
+cat Ascosphaera_apis.5105.GCA_001636715.1_AAP_1.0_protein.faa | sed -r '/^[>].*/{s/[^-[:alnum:]._> ]//g}' | sed 's/ /_/g' > Ascosphaera_apis.5105.GCA_001636715.1_AAP_1.0_protein.sane.faa ; \
+cat Nosema_apis.35231.GCA_000447185.1_NapisBRLv01_protein.faa | sed -r '/^[>].*/{s/[^-[:alnum:]._> ]//g}' | sed 's/ /_/g' > Nosema_apis.35231.GCA_000447185.1_NapisBRLv01_protein.sane.faa ; \
+cat Nosema_ceranae.40302.GCF_000182985.1_ASM18298v1_protein.faa | sed -r '/^[>].*/{s/[^-[:alnum:]._> ]//g}' | sed 's/ /_/g' > Nosema_ceranae.40302.GCF_000182985.1_ASM18298v1_protein.sane.faa ; \
+cat Melissococcus_plutonius.33970.GCF_000270185.1_ASM27018v1_protein.faa | sed -r '/^[>].*/{s/[^-[:alnum:]._> ]//g}' | sed 's/ /_/g' > Melissococcus_plutonius.33970.GCF_000270185.1_ASM27018v1_protein.sane.faa ; \
+cat Paenibacillus_larvae.1464.GCF_002003265.1_ASM200326v1_protein.faa | sed -r '/^[>].*/{s/[^-[:alnum:]._> ]//g}' | sed 's/ /_/g' > Paenibacillus_larvae.1464.GCF_002003265.1_ASM200326v1_protein.sane.faa ; \
+cat Paenibacillus_alvei.44250.GCF_000293805.1_ASM29380v1_protein.faa | sed -r '/^[>].*/{s/[^-[:alnum:]._> ]//g}' | sed 's/ /_/g' > Paenibacillus_alvei.44250.GCF_000293805.1_ASM29380v1_protein.sane.faa ; \
+cat Brevibacillus_laterosporus.1465.GCF_000219535.2_ASM21953v3_protein.faa | sed -r '/^[>].*/{s/[^-[:alnum:]._> ]//g}' | sed 's/ /_/g' > Brevibacillus_laterosporus.1465.GCF_000219535.2_ASM21953v3_protein.sane.faa ; \
+cat Enterococcus_faecalis.1351.GCF_000007785.1_ASM778v1_protein.faa | sed -r '/^[>].*/{s/[^-[:alnum:]._> ]//g}' | sed 's/ /_/g' > Enterococcus_faecalis.1351.GCF_000007785.1_ASM778v1_protein.sane.faa ; \
+cat Spiroplasma_apis.2137.GCF_000500935.1_ASM50093v1_protein.faa | sed -r '/^[>].*/{s/[^-[:alnum:]._> ]//g}' | sed 's/ /_/g' > Spiroplasma_apis.2137.GCF_000500935.1_ASM50093v1_protein.sane.faa ; \
+cat Spiroplasma_melliferum.2134.GCF_000236085.2_SpiMel2.0_protein.faa | sed -r '/^[>].*/{s/[^-[:alnum:]._> ]//g}' | sed 's/ /_/g' > Spiroplasma_melliferum.2134.GCF_000236085.2_SpiMel2.0_protein.sane.faa ; \
+cat Frischella_perrara.1267021.GCF_000807275.1_ASM80727v1_protein.faa | sed -r '/^[>].*/{s/[^-[:alnum:]._> ]//g}' | sed 's/ /_/g' > Frischella_perrara.1267021.GCF_000807275.1_ASM80727v1_protein.sane.faa ; \
+cat Gilliamella_apicola.1196095.GCF_000599985.1_ASM59998v1_protein.faa | sed -r '/^[>].*/{s/[^-[:alnum:]._> ]//g}' | sed 's/ /_/g' > Gilliamella_apicola.1196095.GCF_000599985.1_ASM59998v1_protein.sane.faa ; \
+cat Snodgrasella_alvi.1196083.GCF_000600005.1_ASM60000v1_protein.faa | sed -r '/^[>].*/{s/[^-[:alnum:]._> ]//g}' | sed 's/ /_/g' > Snodgrasella_alvi.1196083.GCF_000600005.1_ASM60000v1_protein.sane.faa ; \
+cat Lactobacillus_kimbladii.1218506.GCF_000970755.1_ASM97075v1_protein.faa | sed -r '/^[>].*/{s/[^-[:alnum:]._> ]//g}' | sed 's/ /_/g' > Lactobacillus_kimbladii.1218506.GCF_000970755.1_ASM97075v1_protein.sane.faa ; \
+cat Lactobacillus_mellifer.1218492.GCF_000970795.1_ASM97079v1_protein.faa | sed -r '/^[>].*/{s/[^-[:alnum:]._> ]//g}' | sed 's/ /_/g' > Lactobacillus_mellifer.1218492.GCF_000970795.1_ASM97079v1_protein.sane.faa ; \
+cat Lactobacillus_kullabergensis.1218493.GCF_000967195.1_ASM96719v1_protein.faa | sed -r '/^[>].*/{s/[^-[:alnum:]._> ]//g}' | sed 's/ /_/g' > Lactobacillus_kullabergensis.1218493.GCF_000967195.1_ASM96719v1_protein.sane.faa ; \
+cat Lactobacillus_mellis.1218508.GCF_000967245.1_ASM96724v1_protein.faa | sed -r '/^[>].*/{s/[^-[:alnum:]._> ]//g}' | sed 's/ /_/g' > Lactobacillus_mellis.1218508.GCF_000967245.1_ASM96724v1_protein.sane.faa ; \
+cat Lactobacillus_melliventris.1218507.GCF_000970775.1_ASM97077v1_protein.faa | sed -r '/^[>].*/{s/[^-[:alnum:]._> ]//g}' | sed 's/ /_/g' > Lactobacillus_melliventris.1218507.GCF_000970775.1_ASM97077v1_protein.sane.faa ; \
+cat Lactobacillus_helsingborgensis.1218494.GCF_000970855.1_ASM97085v1_protein.faa | sed -r '/^[>].*/{s/[^-[:alnum:]._> ]//g}' | sed 's/ /_/g' > Lactobacillus_helsingborgensis.1218494.GCF_000970855.1_ASM97085v1_protein.sane.faa ; \
+cat Bartonella_apis.1686310.GCF_002007565.1_ASM200756v1_protein.faa | sed -r '/^[>].*/{s/[^-[:alnum:]._> ]//g}' | sed 's/ /_/g' > Bartonella_apis.1686310.GCF_002007565.1_ASM200756v1_protein.sane.faa ; \
+cat Parasaccharibacter_apium.1510841.GCF_002079945.1_ASM207994v1_protein.faa | sed -r '/^[>].*/{s/[^-[:alnum:]._> ]//g}' | sed 's/ /_/g' > Parasaccharibacter_apium.1510841.GCF_002079945.1_ASM207994v1_protein.sane.faa ; \
+cat Lactobacillus_kunkeei.148814.GCF_001314945.1_ASM131494v1_protein.faa | sed -r '/^[>].*/{s/[^-[:alnum:]._> ]//g}' | sed 's/ /_/g' > Lactobacillus_kunkeei.148814.GCF_001314945.1_ASM131494v1_protein.sane.faa ; \
+cat Fructobacillus_fructosus.1631.GCF_001438695.1_ASM143869v1_protein.faa | sed -r '/^[>].*/{s/[^-[:alnum:]._> ]//g}' | sed 's/ /_/g' > Fructobacillus_fructosus.1631.GCF_001438695.1_ASM143869v1_protein.sane.faa ; \
+cat Saccharibacter_floricola.231053.GCF_000378165.1_ASM37816v1_protein.faa | sed -r '/^[>].*/{s/[^-[:alnum:]._> ]//g}' | sed 's/ /_/g' > Saccharibacter_floricola.231053.GCF_000378165.1_ASM37816v1_protein.sane.faa ; \
+cat Bifidobacterium_asteroides.1684.GCF_000304215.1_ASM30421v1_protein.faa | sed -r '/^[>].*/{s/[^-[:alnum:]._> ]//g}' | sed 's/ /_/g' > Bifidobacterium_asteroides.1684.GCF_000304215.1_ASM30421v1_protein.sane.faa ; \
+cat Bifidobacterium_actinocoloniiforme.638619.GCF_001263395.1_ASM126339v1_protein.faa | sed -r '/^[>].*/{s/[^-[:alnum:]._> ]//g}' | sed 's/ /_/g' > Bifidobacterium_actinocoloniiforme.638619.GCF_001263395.1_ASM126339v1_protein.sane.faa ; \
+cat Bifidobacterium_bohemicum.638617.GCF_000741525.1_Bifboh_protein.faa | sed -r '/^[>].*/{s/[^-[:alnum:]._> ]//g}' | sed 's/ /_/g' > Bifidobacterium_bohemicum.638617.GCF_000741525.1_Bifboh_protein.sane.faa
+cat *.sane.faa > literature_prot.faa
+makeblastdb -dbtype prot -in literature_prot.faa
+
+# make taxmap
+grep '^>' Apis_mellifera_filamentous_virus.1100043.protein.sane.faa | sed 's/>//g' | perl -lane 'chomp; print $_."\t1100043"' > Apis_mellifera_filamentous_virus.1100043.protein.sane.taxmap ; \
+grep '^>' Ascosphaera_apis.5105.GCA_001636715.1_AAP_1.0_protein.sane.faa | sed 's/>//g' | perl -lane 'chomp; print $_."\t5105"' > Ascosphaera_apis.5105.GCA_001636715.1_AAP_1.0_protein.sane.taxmap ; \
+grep '^>' Nosema_apis.35231.GCA_000447185.1_NapisBRLv01_protein.sane.faa | sed 's/>//g' | perl -lane 'chomp; print $_."\t35231"' > Nosema_apis.35231.GCA_000447185.1_NapisBRLv01_protein.sane.taxmap ; \
+grep '^>' Nosema_ceranae.40302.GCF_000182985.1_ASM18298v1_protein.sane.faa | sed 's/>//g' | perl -lane 'chomp; print $_."\t40302"' > Nosema_ceranae.40302.GCF_000182985.1_ASM18298v1_protein.sane.taxmap ; \
+grep '^>' Melissococcus_plutonius.33970.GCF_000270185.1_ASM27018v1_protein.sane.faa | sed 's/>//g' | perl -lane 'chomp; print $_."\t33970"' > Melissococcus_plutonius.33970.GCF_000270185.1_ASM27018v1_protein.sane.taxmap ; \
+grep '^>' Paenibacillus_larvae.1464.GCF_002003265.1_ASM200326v1_protein.sane.faa | sed 's/>//g' | perl -lane 'chomp; print $_."\t1464"' > Paenibacillus_larvae.1464.GCF_002003265.1_ASM200326v1_protein.sane.taxmap ; \
+grep '^>' Paenibacillus_alvei.44250.GCF_000293805.1_ASM29380v1_protein.sane.faa | sed 's/>//g' | perl -lane 'chomp; print $_."\t44250"' > Paenibacillus_alvei.44250.GCF_000293805.1_ASM29380v1_protein.sane.taxmap ; \
+grep '^>' Brevibacillus_laterosporus.1465.GCF_000219535.2_ASM21953v3_protein.sane.faa | sed 's/>//g' | perl -lane 'chomp; print $_."\t1465"' > Brevibacillus_laterosporus.1465.GCF_000219535.2_ASM21953v3_protein.sane.taxmap ; \
+grep '^>' Enterococcus_faecalis.1351.GCF_000007785.1_ASM778v1_protein.sane.faa | sed 's/>//g' | perl -lane 'chomp; print $_."\t1351"' > Enterococcus_faecalis.1351.GCF_000007785.1_ASM778v1_protein.sane.taxmap ; \
+grep '^>' Spiroplasma_apis.2137.GCF_000500935.1_ASM50093v1_protein.sane.faa | sed 's/>//g' | perl -lane 'chomp; print $_."\t2137"' > Spiroplasma_apis.2137.GCF_000500935.1_ASM50093v1_protein.sane.taxmap ; \
+grep '^>' Spiroplasma_melliferum.2134.GCF_000236085.2_SpiMel2.0_protein.sane.faa | sed 's/>//g' | perl -lane 'chomp; print $_."\t2134"' > Spiroplasma_melliferum.2134.GCF_000236085.2_SpiMel2.0_protein.sane.taxmap ; \
+grep '^>' Frischella_perrara.1267021.GCF_000807275.1_ASM80727v1_protein.sane.faa | sed 's/>//g' | perl -lane 'chomp; print $_."\t1267021"' > Frischella_perrara.1267021.GCF_000807275.1_ASM80727v1_protein.sane.taxmap ; \
+grep '^>' Gilliamella_apicola.1196095.GCF_000599985.1_ASM59998v1_protein.sane.faa | sed 's/>//g' | perl -lane 'chomp; print $_."\t1196095"' > Gilliamella_apicola.1196095.GCF_000599985.1_ASM59998v1_protein.sane.taxmap ; \
+grep '^>' Snodgrasella_alvi.1196083.GCF_000600005.1_ASM60000v1_protein.sane.faa | sed 's/>//g' | perl -lane 'chomp; print $_."\t1196083"' > Snodgrasella_alvi.1196083.GCF_000600005.1_ASM60000v1_protein.sane.taxmap ; \
+grep '^>' Lactobacillus_kimbladii.1218506.GCF_000970755.1_ASM97075v1_protein.sane.faa | sed 's/>//g' | perl -lane 'chomp; print $_."\t1218506"' > Lactobacillus_kimbladii.1218506.GCF_000970755.1_ASM97075v1_protein.sane.taxmap ; \
+grep '^>' Lactobacillus_mellifer.1218492.GCF_000970795.1_ASM97079v1_protein.sane.faa | sed 's/>//g' | perl -lane 'chomp; print $_."\t1218492"' > Lactobacillus_mellifer.1218492.GCF_000970795.1_ASM97079v1_protein.sane.taxmap ; \
+grep '^>' Lactobacillus_kullabergensis.1218493.GCF_000967195.1_ASM96719v1_protein.sane.faa | sed 's/>//g' | perl -lane 'chomp; print $_."\t1218493"' > Lactobacillus_kullabergensis.1218493.GCF_000967195.1_ASM96719v1_protein.sane.taxmap ; \
+grep '^>' Lactobacillus_mellis.1218508.GCF_000967245.1_ASM96724v1_protein.sane.faa | sed 's/>//g' | perl -lane 'chomp; print $_."\t1218508"' > Lactobacillus_mellis.1218508.GCF_000967245.1_ASM96724v1_protein.sane.taxmap ; \
+grep '^>' Lactobacillus_melliventris.1218507.GCF_000970775.1_ASM97077v1_protein.sane.faa | sed 's/>//g' | perl -lane 'chomp; print $_."\t1218507"' > Lactobacillus_melliventris.1218507.GCF_000970775.1_ASM97077v1_protein.sane.taxmap ; \
+grep '^>' Lactobacillus_helsingborgensis.1218494.GCF_000970855.1_ASM97085v1_protein.sane.faa | sed 's/>//g' | perl -lane 'chomp; print $_."\t1218494"' > Lactobacillus_helsingborgensis.1218494.GCF_000970855.1_ASM97085v1_protein.sane.taxmap ; \
+grep '^>' Bartonella_apis.1686310.GCF_002007565.1_ASM200756v1_protein.sane.faa | sed 's/>//g' | perl -lane 'chomp; print $_."\t1686310"' > Bartonella_apis.1686310.GCF_002007565.1_ASM200756v1_protein.sane.taxmap ; \
+grep '^>' Parasaccharibacter_apium.1510841.GCF_002079945.1_ASM207994v1_protein.sane.faa | sed 's/>//g' | perl -lane 'chomp; print $_."\t1510841"' > Parasaccharibacter_apium.1510841.GCF_002079945.1_ASM207994v1_protein.sane.taxmap ; \
+grep '^>' Lactobacillus_kunkeei.148814.GCF_001314945.1_ASM131494v1_protein.sane.faa | sed 's/>//g' | perl -lane 'chomp; print $_."\t148814"' > Lactobacillus_kunkeei.148814.GCF_001314945.1_ASM131494v1_protein.sane.taxmap ; \
+grep '^>' Fructobacillus_fructosus.1631.GCF_001438695.1_ASM143869v1_protein.sane.faa | sed 's/>//g' | perl -lane 'chomp; print $_."\t1631"' > Fructobacillus_fructosus.1631.GCF_001438695.1_ASM143869v1_protein.sane.taxmap ; \
+grep '^>' Saccharibacter_floricola.231053.GCF_000378165.1_ASM37816v1_protein.sane.faa | sed 's/>//g' | perl -lane 'chomp; print $_."\t231053"' > Saccharibacter_floricola.231053.GCF_000378165.1_ASM37816v1_protein.sane.taxmap ; \
+grep '^>' Bifidobacterium_asteroides.1684.GCF_000304215.1_ASM30421v1_protein.sane.faa | sed 's/>//g' | perl -lane 'chomp; print $_."\t1684"' > Bifidobacterium_asteroides.1684.GCF_000304215.1_ASM30421v1_protein.sane.taxmap ; \
+grep '^>' Bifidobacterium_actinocoloniiforme.638619.GCF_001263395.1_ASM126339v1_protein.sane.faa | sed 's/>//g' | perl -lane 'chomp; print $_."\t638619"' > Bifidobacterium_actinocoloniiforme.638619.GCF_001263395.1_ASM126339v1_protein.sane.taxmap ; \
+grep '^>' Bifidobacterium_bohemicum.638617.GCF_000741525.1_Bifboh_protein.sane.faa | sed 's/>//g' | perl -lane 'chomp; print $_."\t638617"' > Bifidobacterium_bohemicum.638617.sane.GCF_000741525.1_Bifboh_protein.taxmap
+cat *.taxmap > literature_prot.taxids
+
+
+# nucl (30)
+cat Apis_mellifera_filamentous_virus.1100043.genomic.fna | sed -r '/^[>].*/{s/[^-[:alnum:]._> ]//g}' | sed 's/ /_/g' > Apis_mellifera_filamentous_virus.1100043.genomic.sane.fna ; \
+cat Ascosphaera_apis.5105.GCA_001636715.1_AAP_1.0_genomic.fna | sed -r '/^[>].*/{s/[^-[:alnum:]._> ]//g}' | sed 's/ /_/g' > Ascosphaera_apis.5105.GCA_001636715.1_AAP_1.0_genomic.sane.fna ; \
+cat Nosema_apis.35231.GCA_000447185.1_NapisBRLv01_genomic.fna | sed -r '/^[>].*/{s/[^-[:alnum:]._> ]//g}' | sed 's/ /_/g' > Nosema_apis.35231.GCA_000447185.1_NapisBRLv01_genomic.sane.fna ; \
+cat Nosema_ceranae.40302.GCF_000182985.1_ASM18298v1_genomic.fna | sed -r '/^[>].*/{s/[^-[:alnum:]._> ]//g}' | sed 's/ /_/g' > Nosema_ceranae.40302.GCF_000182985.1_ASM18298v1_genomic.sane.fna ; \
+cat Melissococcus_plutonius.33970.GCF_000270185.1_ASM27018v1_genomic.fna | sed -r '/^[>].*/{s/[^-[:alnum:]._> ]//g}' | sed 's/ /_/g' > Melissococcus_plutonius.33970.GCF_000270185.1_ASM27018v1_genomic.sane.fna ; \
+cat Paenibacillus_larvae.1464.GCF_002003265.1_ASM200326v1_genomic.fna | sed -r '/^[>].*/{s/[^-[:alnum:]._> ]//g}' | sed 's/ /_/g' > Paenibacillus_larvae.1464.GCF_002003265.1_ASM200326v1_genomic.sane.fna ; \
+cat Paenibacillus_alvei.44250.GCF_000293805.1_ASM29380v1_genomic.fna | sed -r '/^[>].*/{s/[^-[:alnum:]._> ]//g}' | sed 's/ /_/g' > Paenibacillus_alvei.44250.GCF_000293805.1_ASM29380v1_genomic.sane.fna ; \
+cat Brevibacillus_laterosporus.1465.GCF_000219535.2_ASM21953v3_genomic.fna | sed -r '/^[>].*/{s/[^-[:alnum:]._> ]//g}' | sed 's/ /_/g' > Brevibacillus_laterosporus.1465.GCF_000219535.2_ASM21953v3_genomic.sane.fna ; \
+cat Enterococcus_faecalis.1351.GCF_000007785.1_ASM778v1_genomic.fna | sed -r '/^[>].*/{s/[^-[:alnum:]._> ]//g}' | sed 's/ /_/g' > Enterococcus_faecalis.1351.GCF_000007785.1_ASM778v1_genomic.sane.fna ; \
+cat Spiroplasma_apis.2137.GCF_000500935.1_ASM50093v1_genomic.fna | sed -r '/^[>].*/{s/[^-[:alnum:]._> ]//g}' | sed 's/ /_/g' > Spiroplasma_apis.2137.GCF_000500935.1_ASM50093v1_genomic.sane.fna ; \
+cat Spiroplasma_melliferum.2134.GCF_000236085.2_SpiMel2.0_genomic.fna | sed -r '/^[>].*/{s/[^-[:alnum:]._> ]//g}' | sed 's/ /_/g' > Spiroplasma_melliferum.2134.GCF_000236085.2_SpiMel2.0_genomic.sane.fna ; \
+cat Crithidia_mellificae.796356.GCA_002216565.1_ASM221656v1_genomic.fna | sed -r '/^[>].*/{s/[^-[:alnum:]._> ]//g}' | sed 's/ /_/g' > Crithidia_mellificae.796356.GCA_002216565.1_ASM221656v1_genomic.sane.fna ; \
+cat Lotmaria_passim.1620387.GCA_000635995.1_ASM63599v1_genomic.fna | sed -r '/^[>].*/{s/[^-[:alnum:]._> ]//g}' | sed 's/ /_/g' > Lotmaria_passim.1620387.GCA_000635995.1_ASM63599v1_genomic.sane.fna ; \
+cat Frischella_perrara.1267021.GCF_000807275.1_ASM80727v1_genomic.fna | sed -r '/^[>].*/{s/[^-[:alnum:]._> ]//g}' | sed 's/ /_/g' > Frischella_perrara.1267021.GCF_000807275.1_ASM80727v1_genomic.sane.fna ; \
+cat Gilliamella_apicola.1196095.GCF_000599985.1_ASM59998v1_genomic.fna | sed -r '/^[>].*/{s/[^-[:alnum:]._> ]//g}' | sed 's/ /_/g' > Gilliamella_apicola.1196095.GCF_000599985.1_ASM59998v1_genomic.sane.fna ; \
+cat Snodgrasella_alvi.1196083.GCF_000600005.1_ASM60000v1_genomic.fna | sed -r '/^[>].*/{s/[^-[:alnum:]._> ]//g}' | sed 's/ /_/g' > Snodgrasella_alvi.1196083.GCF_000600005.1_ASM60000v1_genomic.sane.fna ; \
+cat Lactobacillus_kimbladii.1218506.GCF_000970755.1_ASM97075v1_genomic.fna | sed -r '/^[>].*/{s/[^-[:alnum:]._> ]//g}' | sed 's/ /_/g' > Lactobacillus_kimbladii.1218506.GCF_000970755.1_ASM97075v1_genomic.sane.fna ; \
+cat Lactobacillus_mellifer.1218492.GCF_000970795.1_ASM97079v1_genomic.fna | sed -r '/^[>].*/{s/[^-[:alnum:]._> ]//g}' | sed 's/ /_/g' > Lactobacillus_mellifer.1218492.GCF_000970795.1_ASM97079v1_genomic.sane.fna ; \
+cat Lactobacillus_kullabergensis.1218493.GCF_000967195.1_ASM96719v1_genomic.fna | sed -r '/^[>].*/{s/[^-[:alnum:]._> ]//g}' | sed 's/ /_/g' > Lactobacillus_kullabergensis.1218493.GCF_000967195.1_ASM96719v1_genomic.sane.fna ; \
+cat Lactobacillus_mellis.1218508.GCF_000967245.1_ASM96724v1_genomic.fna | sed -r '/^[>].*/{s/[^-[:alnum:]._> ]//g}' | sed 's/ /_/g' > Lactobacillus_mellis.1218508.GCF_000967245.1_ASM96724v1_genomic.sane.fna ; \
+cat Lactobacillus_melliventris.1218507.GCF_000970775.1_ASM97077v1_genomic.fna | sed -r '/^[>].*/{s/[^-[:alnum:]._> ]//g}' | sed 's/ /_/g' > Lactobacillus_melliventris.1218507.GCF_000970775.1_ASM97077v1_genomic.sane.fna ; \
+cat Lactobacillus_helsingborgensis.1218494.GCF_000970855.1_ASM97085v1_genomic.fna | sed -r '/^[>].*/{s/[^-[:alnum:]._> ]//g}' | sed 's/ /_/g' > Lactobacillus_helsingborgensis.1218494.GCF_000970855.1_ASM97085v1_genomic.sane.fna ; \
+cat Bartonella_apis.1686310.GCF_002007565.1_ASM200756v1_genomic.fna | sed -r '/^[>].*/{s/[^-[:alnum:]._> ]//g}' | sed 's/ /_/g' > Bartonella_apis.1686310.GCF_002007565.1_ASM200756v1_genomic.sane.fna ; \
+cat Parasaccharibacter_apium.1510841.GCF_002079945.1_ASM207994v1_genomic.fna | sed -r '/^[>].*/{s/[^-[:alnum:]._> ]//g}' | sed 's/ /_/g' > Parasaccharibacter_apium.1510841.GCF_002079945.1_ASM207994v1_genomic.sane.fna ; \
+cat Lactobacillus_kunkeei.148814.GCF_001314945.1_ASM131494v1_genomic.fna | sed -r '/^[>].*/{s/[^-[:alnum:]._> ]//g}' | sed 's/ /_/g' > Lactobacillus_kunkeei.148814.GCF_001314945.1_ASM131494v1_genomic.sane.fna ; \
+cat Fructobacillus_fructosus.1631.GCF_001438695.1_ASM143869v1_genomic.fna | sed -r '/^[>].*/{s/[^-[:alnum:]._> ]//g}' | sed 's/ /_/g' > Fructobacillus_fructosus.1631.GCF_001438695.1_ASM143869v1_genomic.sane.fna ; \
+cat Saccharibacter_floricola.231053.GCF_000378165.1_ASM37816v1_genomic.fna | sed -r '/^[>].*/{s/[^-[:alnum:]._> ]//g}' | sed 's/ /_/g' > Saccharibacter_floricola.231053.GCF_000378165.1_ASM37816v1_genomic.sane.fna ; \
+cat Bifidobacterium_asteroides.1684.GCF_000304215.1_ASM30421v1_genomic.fna | sed -r '/^[>].*/{s/[^-[:alnum:]._> ]//g}' | sed 's/ /_/g' > Bifidobacterium_asteroides.1684.GCF_000304215.1_ASM30421v1_genomic.sane.fna ; \
+cat Bifidobacterium_actinocoloniiforme.638619.GCF_001263395.1_ASM126339v1_genomic.fna | sed -r '/^[>].*/{s/[^-[:alnum:]._> ]//g}' | sed 's/ /_/g' > Bifidobacterium_actinocoloniiforme.638619.GCF_001263395.1_ASM126339v1_genomic.sane.fna ; \
+cat Bifidobacterium_bohemicum.638617.GCF_000741525.1_Bifboh_genomic.fna | sed -r '/^[>].*/{s/[^-[:alnum:]._> ]//g}' | sed 's/ /_/g' > Bifidobacterium_bohemicum.638617.GCF_000741525.1_Bifboh_genomic.sane.fna
+cat *.sane.fna > literature_nucl.fna
+makeblastdb -dbtype nucl -in literature_nucl.fna
+
+grep '^>' Apis_mellifera_filamentous_virus.1100043.genomic.sane.fna | sed 's/>//g' | perl -lane 'chomp; print $_."\t1100043"' > Apis_mellifera_filamentous_virus.1100043.genomic.sane.taxmap ; \
+grep '^>' Ascosphaera_apis.5105.GCA_001636715.1_AAP_1.0_genomic.sane.fna | sed 's/>//g' | perl -lane 'chomp; print $_."\t5105"' > Ascosphaera_apis.5105.GCA_001636715.1_AAP_1.0_genomic.sane.taxmap ; \
+grep '^>' Nosema_apis.35231.GCA_000447185.1_NapisBRLv01_genomic.sane.fna | sed 's/>//g' | perl -lane 'chomp; print $_."\t35231"' > Nosema_apis.35231.GCA_000447185.1_NapisBRLv01_genomic.sane.taxmap ; \
+grep '^>' Nosema_ceranae.40302.GCF_000182985.1_ASM18298v1_genomic.sane.fna | sed 's/>//g' | perl -lane 'chomp; print $_."\t40302"' > Nosema_ceranae.40302.GCF_000182985.1_ASM18298v1_genomic.sane.taxmap ; \
+grep '^>' Melissococcus_plutonius.33970.GCF_000270185.1_ASM27018v1_genomic.sane.fna | sed 's/>//g' | perl -lane 'chomp; print $_."\t33970"' > Melissococcus_plutonius.33970.GCF_000270185.1_ASM27018v1_genomic.sane.taxmap ; \
+grep '^>' Paenibacillus_larvae.1464.GCF_002003265.1_ASM200326v1_genomic.sane.fna | sed 's/>//g' | perl -lane 'chomp; print $_."\t1464"' > Paenibacillus_larvae.1464.GCF_002003265.1_ASM200326v1_genomic.sane.taxmap ; \
+grep '^>' Paenibacillus_alvei.44250.GCF_000293805.1_ASM29380v1_genomic.sane.fna | sed 's/>//g' | perl -lane 'chomp; print $_."\t44250"' > Paenibacillus_alvei.44250.GCF_000293805.1_ASM29380v1_genomic.sane.taxmap ; \
+grep '^>' Brevibacillus_laterosporus.1465.GCF_000219535.2_ASM21953v3_genomic.sane.fna | sed 's/>//g' | perl -lane 'chomp; print $_."\t1465"' > Brevibacillus_laterosporus.1465.GCF_000219535.2_ASM21953v3_genomic.sane.taxmap ; \
+grep '^>' Enterococcus_faecalis.1351.GCF_000007785.1_ASM778v1_genomic.sane.fna | sed 's/>//g' | perl -lane 'chomp; print $_."\t1351"' > Enterococcus_faecalis.1351.GCF_000007785.1_ASM778v1_genomic.sane.taxmap ; \
+grep '^>' Spiroplasma_apis.2137.GCF_000500935.1_ASM50093v1_genomic.sane.fna | sed 's/>//g' | perl -lane 'chomp; print $_."\t2137"' > Spiroplasma_apis.2137.GCF_000500935.1_ASM50093v1_genomic.sane.taxmap ; \
+grep '^>' Spiroplasma_melliferum.2134.GCF_000236085.2_SpiMel2.0_genomic.sane.fna | sed 's/>//g' | perl -lane 'chomp; print $_."\t2134"' > Spiroplasma_melliferum.2134.GCF_000236085.2_SpiMel2.0_genosane.taxmap ; \
+grep '^>' Crithidia_mellificae.796356.GCA_002216565.1_ASM221656v1_genomic.sane.fna | sed 's/>//g' | perl -lane 'chomp; print $_."\t796356"' > Crithidia_mellificae.796356.GCA_002216565.1_ASM221656v1_genomic.sane.taxmap ; \
+grep '^>' Lotmaria_passim.1620387.GCA_000635995.1_ASM63599v1_genomic.sane.fna | sed 's/>//g' | perl -lane 'chomp; print $_."\t1620387"' > Lotmaria_passim.1620387.GCA_000635995.1_ASM63599v1_genomic.sane.taxmap ; \
+grep '^>' Frischella_perrara.1267021.GCF_000807275.1_ASM80727v1_genomic.sane.fna | sed 's/>//g' | perl -lane 'chomp; print $_."\t1267021"' > Frischella_perrara.1267021.GCF_000807275.1_ASM80727v1_genomic.sane.taxmap ; \
+grep '^>' Gilliamella_apicola.1196095.GCF_000599985.1_ASM59998v1_genomic.sane.fna | sed 's/>//g' | perl -lane 'chomp; print $_."\t1196095"' > Gilliamella_apicola.1196095.GCF_000599985.1_ASM59998v1_genomic.sane.taxmap ; \
+grep '^>' Snodgrasella_alvi.1196083.GCF_000600005.1_ASM60000v1_genomic.sane.fna | sed 's/>//g' | perl -lane 'chomp; print $_."\t1196083"' > Snodgrasella_alvi.1196083.GCF_000600005.1_ASM60000v1_genomic.sane.taxmap ; \
+grep '^>' Lactobacillus_kimbladii.1218506.GCF_000970755.1_ASM97075v1_genomic.sane.fna | sed 's/>//g' | perl -lane 'chomp; print $_."\t1218506"' > Lactobacillus_kimbladii.1218506.GCF_000970755.1_ASM97075v1_genomic.sane.taxmap ; \
+grep '^>' Lactobacillus_mellifer.1218492.GCF_000970795.1_ASM97079v1_genomic.sane.fna | sed 's/>//g' | perl -lane 'chomp; print $_."\t1218492"' > Lactobacillus_mellifer.1218492.GCF_000970795.1_ASM97079v1_genomic.sane.taxmap ; \
+grep '^>' Lactobacillus_kullabergensis.1218493.GCF_000967195.1_ASM96719v1_genomic.sane.fna | sed 's/>//g' | perl -lane 'chomp; print $_."\t1218493"' > Lactobacillus_kullabergensis.1218493.GCF_000967195.1_ASM96719v1_genomic.sane.taxmap ; \
+grep '^>' Lactobacillus_mellis.1218508.GCF_000967245.1_ASM96724v1_genomic.sane.fna | sed 's/>//g' | perl -lane 'chomp; print $_."\t1218508"' > Lactobacillus_mellis.1218508.GCF_000967245.1_ASM96724v1_genomic.sane.taxmap ; \
+grep '^>' Lactobacillus_melliventris.1218507.GCF_000970775.1_ASM97077v1_genomic.sane.fna | sed 's/>//g' | perl -lane 'chomp; print $_."\t1218507"' > Lactobacillus_melliventris.1218507.GCF_000970775.1_ASM97077v1_genomic.sane.taxmap ; \
+grep '^>' Lactobacillus_helsingborgensis.1218494.GCF_000970855.1_ASM97085v1_genomic.sane.fna | sed 's/>//g' | perl -lane 'chomp; print $_."\t1218494"' > Lactobacillus_helsingborgensis.1218494.GCF_000970855.1_ASM97085v1_genomic.sane.taxmap ; \
+grep '^>' Bartonella_apis.1686310.GCF_002007565.1_ASM200756v1_genomic.sane.fna | sed 's/>//g' | perl -lane 'chomp; print $_."\t1686310"' > Bartonella_apis.1686310.GCF_002007565.1_ASM200756v1_genomic.sane.taxmap ; \
+grep '^>' Parasaccharibacter_apium.1510841.GCF_002079945.1_ASM207994v1_genomic.sane.fna | sed 's/>//g' | perl -lane 'chomp; print $_."\t1510841"' > Parasaccharibacter_apium.1510841.GCF_002079945.1_ASM207994v1_genomic.sane.taxmap ; \
+grep '^>' Lactobacillus_kunkeei.148814.GCF_001314945.1_ASM131494v1_genomic.sane.fna | sed 's/>//g' | perl -lane 'chomp; print $_."\t148814"' > Lactobacillus_kunkeei.148814.GCF_001314945.1_ASM131494v1_genomic.sane.taxmap ; \
+grep '^>' Fructobacillus_fructosus.1631.GCF_001438695.1_ASM143869v1_genomic.sane.fna | sed 's/>//g' | perl -lane 'chomp; print $_."\t1631"' > Fructobacillus_fructosus.1631.GCF_001438695.1_ASM143869v1_genomic.sane.taxmap ; \
+grep '^>' Saccharibacter_floricola.231053.GCF_000378165.1_ASM37816v1_genomic.sane.fna | sed 's/>//g' | perl -lane 'chomp; print $_."\t231053"' > Saccharibacter_floricola.231053.GCF_000378165.1_ASM37816v1_genomic.sane.taxmap ; \
+grep '^>' Bifidobacterium_asteroides.1684.GCF_000304215.1_ASM30421v1_genomic.sane.fna | sed 's/>//g' | perl -lane 'chomp; print $_."\t1684"' > Bifidobacterium_asteroides.1684.GCF_000304215.1_ASM30421v1_genomic.sane.taxmap ; \
+grep '^>' Bifidobacterium_actinocoloniiforme.638619.GCF_001263395.1_ASM126339v1_genomic.sane.fna | sed 's/>//g' | perl -lane 'chomp; print $_."\t638619"' > Bifidobacterium_actinocoloniiforme.638619.GCF_001263395.1_ASM126339v1_genomic.sane.taxmap ; \
+grep '^>' Bifidobacterium_bohemicum.638617.GCF_000741525.1_Bifboh_genomic.sane.fna | sed 's/>//g' | perl -lane 'chomp; print $_."\t638617"' > Bifidobacterium_bohemicum.638617.GCF_000741525.1_Bifboh_genomic.sane.taxmap
+cat *.taxmap > literature_nucl.taxids
+
+
+# searches
+/exports/software/diamond/diamond-v0.9.5/diamond blastx --max-hsps 1 --sensitive --evalue 1e-25 --threads 4 --max-target-seqs 1 --outfmt 6 --tmpdir /scratch/dlaetsch/ --out 10133FT0001.vs.refprot.mts1.hsp1.out --db /exports/blast_db/uniprot/Reference_Proteomes_2017_07/uniprot_ref_proteomes.diamond-v0.9.5.fasta.dmnd --query assemblies/10133FT0001.fasta
+/exports/software/diamond/diamond-v0.9.5/diamond blastx --max-hsps 1 --sensitive --evalue 1e-25 --threads 4 --max-target-seqs 1 --outfmt 6 --tmpdir /scratch/dlaetsch/ --out 10133FT0002.vs.refprot.mts1.hsp1.out --db /exports/blast_db/uniprot/Reference_Proteomes_2017_07/uniprot_ref_proteomes.diamond-v0.9.5.fasta.dmnd --query assemblies/10133FT0002.fasta
+/exports/software/diamond/diamond-v0.9.5/diamond blastx --max-hsps 1 --sensitive --evalue 1e-25 --threads 4 --max-target-seqs 1 --outfmt 6 --tmpdir /scratch/dlaetsch/ --out 10133FT0003.vs.refprot.mts1.hsp1.out --db /exports/blast_db/uniprot/Reference_Proteomes_2017_07/uniprot_ref_proteomes.diamond-v0.9.5.fasta.dmnd --query assemblies/10133FT0003.fasta
+/exports/software/diamond/diamond-v0.9.5/diamond blastx --max-hsps 1 --sensitive --evalue 1e-25 --threads 4 --max-target-seqs 1 --outfmt 6 --tmpdir /scratch/dlaetsch/ --out 10133FT0004.vs.refprot.mts1.hsp1.out --db /exports/blast_db/uniprot/Reference_Proteomes_2017_07/uniprot_ref_proteomes.diamond-v0.9.5.fasta.dmnd --query assemblies/10133FT0004.fasta
+/exports/software/diamond/diamond-v0.9.5/diamond blastx --max-hsps 1 --sensitive --evalue 1e-25 --threads 4 --max-target-seqs 1 --outfmt 6 --tmpdir /scratch/dlaetsch/ --out 10146FT0010.vs.refprot.mts1.hsp1.out --db /exports/blast_db/uniprot/Reference_Proteomes_2017_07/uniprot_ref_proteomes.diamond-v0.9.5.fasta.dmnd --query assemblies/10146FT0010.fasta
+/exports/software/diamond/diamond-v0.9.5/diamond blastx --max-hsps 1 --sensitive --evalue 1e-25 --threads 4 --max-target-seqs 1 --outfmt 6 --tmpdir /scratch/dlaetsch/ --out 10146FT0011.vs.refprot.mts1.hsp1.out --db /exports/blast_db/uniprot/Reference_Proteomes_2017_07/uniprot_ref_proteomes.diamond-v0.9.5.fasta.dmnd --query assemblies/10146FT0011.fasta
+/exports/software/diamond/diamond-v0.9.5/diamond blastx --max-hsps 1 --sensitive --evalue 1e-25 --threads 4 --max-target-seqs 1 --outfmt 6 --tmpdir /scratch/dlaetsch/ --out 10146FT0012.vs.refprot.mts1.hsp1.out --db /exports/blast_db/uniprot/Reference_Proteomes_2017_07/uniprot_ref_proteomes.diamond-v0.9.5.fasta.dmnd --query assemblies/10146FT0012.fasta
+/exports/software/diamond/diamond-v0.9.5/diamond blastx --max-hsps 1 --sensitive --evalue 1e-25 --threads 4 --max-target-seqs 1 --outfmt 6 --tmpdir /scratch/dlaetsch/ --out 10146FT0013.vs.refprot.mts1.hsp1.out --db /exports/blast_db/uniprot/Reference_Proteomes_2017_07/uniprot_ref_proteomes.diamond-v0.9.5.fasta.dmnd --query assemblies/10146FT0013.fasta
+/exports/software/diamond/diamond-v0.9.5/diamond blastx --max-hsps 1 --sensitive --evalue 1e-25 --threads 4 --max-target-seqs 1 --outfmt 6 --tmpdir /scratch/dlaetsch/ --out 10146FT0014.vs.refprot.mts1.hsp1.out --db /exports/blast_db/uniprot/Reference_Proteomes_2017_07/uniprot_ref_proteomes.diamond-v0.9.5.fasta.dmnd --query assemblies/10146FT0014.fasta
+/exports/software/diamond/diamond-v0.9.5/diamond blastx --max-hsps 1 --sensitive --evalue 1e-25 --threads 4 --max-target-seqs 1 --outfmt 6 --tmpdir /scratch/dlaetsch/ --out 10146FT0015.vs.refprot.mts1.hsp1.out --db /exports/blast_db/uniprot/Reference_Proteomes_2017_07/uniprot_ref_proteomes.diamond-v0.9.5.fasta.dmnd --query assemblies/10146FT0015.fasta
+/exports/software/diamond/diamond-v0.9.5/diamond blastx --max-hsps 1 --sensitive --evalue 1e-25 --threads 4 --max-target-seqs 1 --outfmt 6 --tmpdir /scratch/dlaetsch/ --out 10146FT0016.vs.refprot.mts1.hsp1.out --db /exports/blast_db/uniprot/Reference_Proteomes_2017_07/uniprot_ref_proteomes.diamond-v0.9.5.fasta.dmnd --query assemblies/10146FT0016.fasta
+/exports/software/diamond/diamond-v0.9.5/diamond blastx --max-hsps 1 --sensitive --evalue 1e-25 --threads 4 --max-target-seqs 1 --outfmt 6 --tmpdir /scratch/dlaetsch/ --out RAS10_1699.vs.refprot.mts1.hsp1.out --db /exports/blast_db/uniprot/Reference_Proteomes_2017_07/uniprot_ref_proteomes.diamond-v0.9.5.fasta.dmnd --query assemblies/RAS10_1699.fasta
+/exports/software/diamond/diamond-v0.9.5/diamond blastx --max-hsps 1 --sensitive --evalue 1e-25 --threads 4 --max-target-seqs 1 --outfmt 6 --tmpdir /scratch/dlaetsch/ --out RAS10_1767.vs.refprot.mts1.hsp1.out --db /exports/blast_db/uniprot/Reference_Proteomes_2017_07/uniprot_ref_proteomes.diamond-v0.9.5.fasta.dmnd --query assemblies/RAS10_1767.fasta
+/exports/software/diamond/diamond-v0.9.5/diamond blastx --max-hsps 1 --sensitive --evalue 1e-25 --threads 4 --max-target-seqs 1 --outfmt 6 --tmpdir /scratch/dlaetsch/ --out RAS10_2445.vs.refprot.mts1.hsp1.out --db /exports/blast_db/uniprot/Reference_Proteomes_2017_07/uniprot_ref_proteomes.diamond-v0.9.5.fasta.dmnd --query assemblies/RAS10_2445.fasta
+/exports/software/diamond/diamond-v0.9.5/diamond blastx --max-hsps 1 --sensitive --evalue 1e-25 --threads 4 --max-target-seqs 1 --outfmt 6 --tmpdir /scratch/dlaetsch/ --out SASA_38126.vs.refprot.mts1.hsp1.out --db /exports/blast_db/uniprot/Reference_Proteomes_2017_07/uniprot_ref_proteomes.diamond-v0.9.5.fasta.dmnd --query assemblies/SASA_38126.fasta
+/exports/software/diamond/diamond-v0.9.5/diamond blastx --max-hsps 1 --sensitive --evalue 1e-25 --threads 4 --max-target-seqs 1 --outfmt 6 --tmpdir /scratch/dlaetsch/ --out SASA_39248.vs.refprot.mts1.hsp1.out --db /exports/blast_db/uniprot/Reference_Proteomes_2017_07/uniprot_ref_proteomes.diamond-v0.9.5.fasta.dmnd --query assemblies/SASA_39248.fasta
+/exports/software/diamond/diamond-v0.9.5/diamond blastx --max-hsps 1 --sensitive --evalue 1e-25 --threads 4 --max-target-seqs 1 --outfmt 6 --tmpdir /scratch/dlaetsch/ --out SASA_48316.vs.refprot.mts1.hsp1.out --db /exports/blast_db/uniprot/Reference_Proteomes_2017_07/uniprot_ref_proteomes.diamond-v0.9.5.fasta.dmnd --query assemblies/SASA_48316.fasta
+/exports/software/diamond/diamond-v0.9.5/diamond blastx --max-hsps 1 --sensitive --evalue 1e-25 --threads 4 --max-target-seqs 1 --outfmt 6 --tmpdir /scratch/dlaetsch/ --out SASA_50290.vs.refprot.mts1.hsp1.out --db /exports/blast_db/uniprot/Reference_Proteomes_2017_07/uniprot_ref_proteomes.diamond-v0.9.5.fasta.dmnd --query assemblies/SASA_50290.fasta
+/exports/software/diamond/diamond-v0.9.5/diamond blastx --max-hsps 1 --sensitive --evalue 1e-25 --threads 4 --max-target-seqs 1 --outfmt 6 --tmpdir /scratch/dlaetsch/ --out SASA_53035.vs.refprot.mts1.hsp1.out --db /exports/blast_db/uniprot/Reference_Proteomes_2017_07/uniprot_ref_proteomes.diamond-v0.9.5.fasta.dmnd --query assemblies/SASA_53035.fasta
+/exports/software/diamond/diamond-v0.9.5/diamond blastx --max-hsps 1 --sensitive --evalue 1e-25 --threads 4 --max-target-seqs 1 --outfmt 6 --tmpdir /scratch/dlaetsch/ --out SASA_54939.vs.refprot.mts1.hsp1.out --db /exports/blast_db/uniprot/Reference_Proteomes_2017_07/uniprot_ref_proteomes.diamond-v0.9.5.fasta.dmnd --query assemblies/SASA_54939.fasta
+/exports/software/diamond/diamond-v0.9.5/diamond blastx --max-hsps 1 --sensitive --evalue 1e-25 --threads 4 --max-target-seqs 1 --outfmt 6 --tmpdir /scratch/dlaetsch/ --out SASA_55706.vs.refprot.mts1.hsp1.out --db /exports/blast_db/uniprot/Reference_Proteomes_2017_07/uniprot_ref_proteomes.diamond-v0.9.5.fasta.dmnd --query assemblies/SASA_55706.fasta
+/exports/software/diamond/diamond-v0.9.5/diamond blastx --max-hsps 1 --sensitive --evalue 1e-25 --threads 4 --max-target-seqs 1 --outfmt 6 --tmpdir /scratch/dlaetsch/ --out SASA_56281.vs.refprot.mts1.hsp1.out --db /exports/blast_db/uniprot/Reference_Proteomes_2017_07/uniprot_ref_proteomes.diamond-v0.9.5.fasta.dmnd --query assemblies/SASA_56281.fasta
+/exports/software/diamond/diamond-v0.9.5/diamond blastx --max-hsps 1 --sensitive --evalue 1e-25 --threads 4 --max-target-seqs 1 --outfmt 6 --tmpdir /scratch/dlaetsch/ --out SASA_57276.vs.refprot.mts1.hsp1.out --db /exports/blast_db/uniprot/Reference_Proteomes_2017_07/uniprot_ref_proteomes.diamond-v0.9.5.fasta.dmnd --query assemblies/SASA_57276.fasta
+/exports/software/diamond/diamond-v0.9.5/diamond blastx --max-hsps 1 --sensitive --evalue 1e-25 --threads 4 --max-target-seqs 1 --outfmt 6 --tmpdir /scratch/dlaetsch/ --out 10133FT0001.vs.literature_prot.mts1.hsp1.out --db literature_prot/literature_prot.diamond-v0.9.5.dmnd --query assemblies/10133FT0001.fasta
+/exports/software/diamond/diamond-v0.9.5/diamond blastx --max-hsps 1 --sensitive --evalue 1e-25 --threads 4 --max-target-seqs 1 --outfmt 6 --tmpdir /scratch/dlaetsch/ --out 10133FT0002.vs.literature_prot.mts1.hsp1.out --db literature_prot/literature_prot.diamond-v0.9.5.dmnd --query assemblies/10133FT0002.fasta
+/exports/software/diamond/diamond-v0.9.5/diamond blastx --max-hsps 1 --sensitive --evalue 1e-25 --threads 4 --max-target-seqs 1 --outfmt 6 --tmpdir /scratch/dlaetsch/ --out 10133FT0003.vs.literature_prot.mts1.hsp1.out --db literature_prot/literature_prot.diamond-v0.9.5.dmnd --query assemblies/10133FT0003.fasta
+/exports/software/diamond/diamond-v0.9.5/diamond blastx --max-hsps 1 --sensitive --evalue 1e-25 --threads 4 --max-target-seqs 1 --outfmt 6 --tmpdir /scratch/dlaetsch/ --out 10133FT0004.vs.literature_prot.mts1.hsp1.out --db literature_prot/literature_prot.diamond-v0.9.5.dmnd --query assemblies/10133FT0004.fasta
+/exports/software/diamond/diamond-v0.9.5/diamond blastx --max-hsps 1 --sensitive --evalue 1e-25 --threads 4 --max-target-seqs 1 --outfmt 6 --tmpdir /scratch/dlaetsch/ --out 10146FT0010.vs.literature_prot.mts1.hsp1.out --db literature_prot/literature_prot.diamond-v0.9.5.dmnd --query assemblies/10146FT0010.fasta
+/exports/software/diamond/diamond-v0.9.5/diamond blastx --max-hsps 1 --sensitive --evalue 1e-25 --threads 4 --max-target-seqs 1 --outfmt 6 --tmpdir /scratch/dlaetsch/ --out 10146FT0011.vs.literature_prot.mts1.hsp1.out --db literature_prot/literature_prot.diamond-v0.9.5.dmnd --query assemblies/10146FT0011.fasta
+/exports/software/diamond/diamond-v0.9.5/diamond blastx --max-hsps 1 --sensitive --evalue 1e-25 --threads 4 --max-target-seqs 1 --outfmt 6 --tmpdir /scratch/dlaetsch/ --out 10146FT0012.vs.literature_prot.mts1.hsp1.out --db literature_prot/literature_prot.diamond-v0.9.5.dmnd --query assemblies/10146FT0012.fasta
+/exports/software/diamond/diamond-v0.9.5/diamond blastx --max-hsps 1 --sensitive --evalue 1e-25 --threads 4 --max-target-seqs 1 --outfmt 6 --tmpdir /scratch/dlaetsch/ --out 10146FT0013.vs.literature_prot.mts1.hsp1.out --db literature_prot/literature_prot.diamond-v0.9.5.dmnd --query assemblies/10146FT0013.fasta
+/exports/software/diamond/diamond-v0.9.5/diamond blastx --max-hsps 1 --sensitive --evalue 1e-25 --threads 4 --max-target-seqs 1 --outfmt 6 --tmpdir /scratch/dlaetsch/ --out 10146FT0014.vs.literature_prot.mts1.hsp1.out --db literature_prot/literature_prot.diamond-v0.9.5.dmnd --query assemblies/10146FT0014.fasta
+/exports/software/diamond/diamond-v0.9.5/diamond blastx --max-hsps 1 --sensitive --evalue 1e-25 --threads 4 --max-target-seqs 1 --outfmt 6 --tmpdir /scratch/dlaetsch/ --out 10146FT0015.vs.literature_prot.mts1.hsp1.out --db literature_prot/literature_prot.diamond-v0.9.5.dmnd --query assemblies/10146FT0015.fasta
+/exports/software/diamond/diamond-v0.9.5/diamond blastx --max-hsps 1 --sensitive --evalue 1e-25 --threads 4 --max-target-seqs 1 --outfmt 6 --tmpdir /scratch/dlaetsch/ --out 10146FT0016.vs.literature_prot.mts1.hsp1.out --db literature_prot/literature_prot.diamond-v0.9.5.dmnd --query assemblies/10146FT0016.fasta
+/exports/software/diamond/diamond-v0.9.5/diamond blastx --max-hsps 1 --sensitive --evalue 1e-25 --threads 4 --max-target-seqs 1 --outfmt 6 --tmpdir /scratch/dlaetsch/ --out RAS10_1699.vs.literature_prot.mts1.hsp1.out --db literature_prot/literature_prot.diamond-v0.9.5.dmnd --query assemblies/RAS10_1699.fasta
+/exports/software/diamond/diamond-v0.9.5/diamond blastx --max-hsps 1 --sensitive --evalue 1e-25 --threads 4 --max-target-seqs 1 --outfmt 6 --tmpdir /scratch/dlaetsch/ --out RAS10_1767.vs.literature_prot.mts1.hsp1.out --db literature_prot/literature_prot.diamond-v0.9.5.dmnd --query assemblies/RAS10_1767.fasta
+/exports/software/diamond/diamond-v0.9.5/diamond blastx --max-hsps 1 --sensitive --evalue 1e-25 --threads 4 --max-target-seqs 1 --outfmt 6 --tmpdir /scratch/dlaetsch/ --out RAS10_2445.vs.literature_prot.mts1.hsp1.out --db literature_prot/literature_prot.diamond-v0.9.5.dmnd --query assemblies/RAS10_2445.fasta
+/exports/software/diamond/diamond-v0.9.5/diamond blastx --max-hsps 1 --sensitive --evalue 1e-25 --threads 4 --max-target-seqs 1 --outfmt 6 --tmpdir /scratch/dlaetsch/ --out SASA_38126.vs.literature_prot.mts1.hsp1.out --db literature_prot/literature_prot.diamond-v0.9.5.dmnd --query assemblies/SASA_38126.fasta
+/exports/software/diamond/diamond-v0.9.5/diamond blastx --max-hsps 1 --sensitive --evalue 1e-25 --threads 4 --max-target-seqs 1 --outfmt 6 --tmpdir /scratch/dlaetsch/ --out SASA_39248.vs.literature_prot.mts1.hsp1.out --db literature_prot/literature_prot.diamond-v0.9.5.dmnd --query assemblies/SASA_39248.fasta
+/exports/software/diamond/diamond-v0.9.5/diamond blastx --max-hsps 1 --sensitive --evalue 1e-25 --threads 4 --max-target-seqs 1 --outfmt 6 --tmpdir /scratch/dlaetsch/ --out SASA_48316.vs.literature_prot.mts1.hsp1.out --db literature_prot/literature_prot.diamond-v0.9.5.dmnd --query assemblies/SASA_48316.fasta
+/exports/software/diamond/diamond-v0.9.5/diamond blastx --max-hsps 1 --sensitive --evalue 1e-25 --threads 4 --max-target-seqs 1 --outfmt 6 --tmpdir /scratch/dlaetsch/ --out SASA_50290.vs.literature_prot.mts1.hsp1.out --db literature_prot/literature_prot.diamond-v0.9.5.dmnd --query assemblies/SASA_50290.fasta
+/exports/software/diamond/diamond-v0.9.5/diamond blastx --max-hsps 1 --sensitive --evalue 1e-25 --threads 4 --max-target-seqs 1 --outfmt 6 --tmpdir /scratch/dlaetsch/ --out SASA_53035.vs.literature_prot.mts1.hsp1.out --db literature_prot/literature_prot.diamond-v0.9.5.dmnd --query assemblies/SASA_53035.fasta
+/exports/software/diamond/diamond-v0.9.5/diamond blastx --max-hsps 1 --sensitive --evalue 1e-25 --threads 4 --max-target-seqs 1 --outfmt 6 --tmpdir /scratch/dlaetsch/ --out SASA_54939.vs.literature_prot.mts1.hsp1.out --db literature_prot/literature_prot.diamond-v0.9.5.dmnd --query assemblies/SASA_54939.fasta
+/exports/software/diamond/diamond-v0.9.5/diamond blastx --max-hsps 1 --sensitive --evalue 1e-25 --threads 4 --max-target-seqs 1 --outfmt 6 --tmpdir /scratch/dlaetsch/ --out SASA_55706.vs.literature_prot.mts1.hsp1.out --db literature_prot/literature_prot.diamond-v0.9.5.dmnd --query assemblies/SASA_55706.fasta
+/exports/software/diamond/diamond-v0.9.5/diamond blastx --max-hsps 1 --sensitive --evalue 1e-25 --threads 4 --max-target-seqs 1 --outfmt 6 --tmpdir /scratch/dlaetsch/ --out SASA_56281.vs.literature_prot.mts1.hsp1.out --db literature_prot/literature_prot.diamond-v0.9.5.dmnd --query assemblies/SASA_56281.fasta
+/exports/software/diamond/diamond-v0.9.5/diamond blastx --max-hsps 1 --sensitive --evalue 1e-25 --threads 4 --max-target-seqs 1 --outfmt 6 --tmpdir /scratch/dlaetsch/ --out SASA_57276.vs.literature_prot.mts1.hsp1.out --db literature_prot/literature_prot.diamond-v0.9.5.dmnd --query assemblies/SASA_57276.fasta
+blastn -evalue 1e-25 -num_threads 4 -outfmt '6 qseqid staxids bitscore std' -max_target_seqs 1 -max_hsps 1 -out /scratch/dlaetsch/10133FT0001.vs.literature_nucl.mts1.hsp1.out -query assemblies/10133FT0001.fasta -db literature_nucl/literature_nucl.fna && rsync -avhP /scratch/dlaetsch/10133FT0001.vs.literature_nucl.mts1.hsp1.out .
+blastn -evalue 1e-25 -num_threads 4 -outfmt '6 qseqid staxids bitscore std' -max_target_seqs 1 -max_hsps 1 -out /scratch/dlaetsch/10133FT0002.vs.literature_nucl.mts1.hsp1.out -query assemblies/10133FT0002.fasta -db literature_nucl/literature_nucl.fna && rsync -avhP /scratch/dlaetsch/10133FT0002.vs.literature_nucl.mts1.hsp1.out .
+blastn -evalue 1e-25 -num_threads 4 -outfmt '6 qseqid staxids bitscore std' -max_target_seqs 1 -max_hsps 1 -out /scratch/dlaetsch/10133FT0003.vs.literature_nucl.mts1.hsp1.out -query assemblies/10133FT0003.fasta -db literature_nucl/literature_nucl.fna && rsync -avhP /scratch/dlaetsch/10133FT0003.vs.literature_nucl.mts1.hsp1.out .
+blastn -evalue 1e-25 -num_threads 4 -outfmt '6 qseqid staxids bitscore std' -max_target_seqs 1 -max_hsps 1 -out /scratch/dlaetsch/10133FT0004.vs.literature_nucl.mts1.hsp1.out -query assemblies/10133FT0004.fasta -db literature_nucl/literature_nucl.fna && rsync -avhP /scratch/dlaetsch/10133FT0004.vs.literature_nucl.mts1.hsp1.out .
+blastn -evalue 1e-25 -num_threads 4 -outfmt '6 qseqid staxids bitscore std' -max_target_seqs 1 -max_hsps 1 -out /scratch/dlaetsch/10146FT0010.vs.literature_nucl.mts1.hsp1.out -query assemblies/10146FT0010.fasta -db literature_nucl/literature_nucl.fna && rsync -avhP /scratch/dlaetsch/10146FT0010.vs.literature_nucl.mts1.hsp1.out .
+blastn -evalue 1e-25 -num_threads 4 -outfmt '6 qseqid staxids bitscore std' -max_target_seqs 1 -max_hsps 1 -out /scratch/dlaetsch/10146FT0011.vs.literature_nucl.mts1.hsp1.out -query assemblies/10146FT0011.fasta -db literature_nucl/literature_nucl.fna && rsync -avhP /scratch/dlaetsch/10146FT0011.vs.literature_nucl.mts1.hsp1.out .
+blastn -evalue 1e-25 -num_threads 4 -outfmt '6 qseqid staxids bitscore std' -max_target_seqs 1 -max_hsps 1 -out /scratch/dlaetsch/10146FT0012.vs.literature_nucl.mts1.hsp1.out -query assemblies/10146FT0012.fasta -db literature_nucl/literature_nucl.fna && rsync -avhP /scratch/dlaetsch/10146FT0012.vs.literature_nucl.mts1.hsp1.out .
+blastn -evalue 1e-25 -num_threads 4 -outfmt '6 qseqid staxids bitscore std' -max_target_seqs 1 -max_hsps 1 -out /scratch/dlaetsch/10146FT0013.vs.literature_nucl.mts1.hsp1.out -query assemblies/10146FT0013.fasta -db literature_nucl/literature_nucl.fna && rsync -avhP /scratch/dlaetsch/10146FT0013.vs.literature_nucl.mts1.hsp1.out .
+blastn -evalue 1e-25 -num_threads 4 -outfmt '6 qseqid staxids bitscore std' -max_target_seqs 1 -max_hsps 1 -out /scratch/dlaetsch/10146FT0014.vs.literature_nucl.mts1.hsp1.out -query assemblies/10146FT0014.fasta -db literature_nucl/literature_nucl.fna && rsync -avhP /scratch/dlaetsch/10146FT0014.vs.literature_nucl.mts1.hsp1.out .
+blastn -evalue 1e-25 -num_threads 4 -outfmt '6 qseqid staxids bitscore std' -max_target_seqs 1 -max_hsps 1 -out /scratch/dlaetsch/10146FT0015.vs.literature_nucl.mts1.hsp1.out -query assemblies/10146FT0015.fasta -db literature_nucl/literature_nucl.fna && rsync -avhP /scratch/dlaetsch/10146FT0015.vs.literature_nucl.mts1.hsp1.out .
+blastn -evalue 1e-25 -num_threads 4 -outfmt '6 qseqid staxids bitscore std' -max_target_seqs 1 -max_hsps 1 -out /scratch/dlaetsch/10146FT0016.vs.literature_nucl.mts1.hsp1.out -query assemblies/10146FT0016.fasta -db literature_nucl/literature_nucl.fna && rsync -avhP /scratch/dlaetsch/10146FT0016.vs.literature_nucl.mts1.hsp1.out .
+blastn -evalue 1e-25 -num_threads 4 -outfmt '6 qseqid staxids bitscore std' -max_target_seqs 1 -max_hsps 1 -out /scratch/dlaetsch/RAS10_1699.vs.literature_nucl.mts1.hsp1.out  -query assemblies/RAS10_1699.fasta -db literature_nucl/literature_nucl.fna && rsync -avhP /scratch/dlaetsch/RAS10_1699.vs.literature_nucl.mts1.hsp1.out .
+blastn -evalue 1e-25 -num_threads 4 -outfmt '6 qseqid staxids bitscore std' -max_target_seqs 1 -max_hsps 1 -out /scratch/dlaetsch/RAS10_1767.vs.literature_nucl.mts1.hsp1.out  -query assemblies/RAS10_1767.fasta -db literature_nucl/literature_nucl.fna && rsync -avhP /scratch/dlaetsch/RAS10_1767.vs.literature_nucl.mts1.hsp1.out .
+blastn -evalue 1e-25 -num_threads 4 -outfmt '6 qseqid staxids bitscore std' -max_target_seqs 1 -max_hsps 1 -out /scratch/dlaetsch/RAS10_2445.vs.literature_nucl.mts1.hsp1.out  -query assemblies/RAS10_2445.fasta -db literature_nucl/literature_nucl.fna && rsync -avhP /scratch/dlaetsch/RAS10_2445.vs.literature_nucl.mts1.hsp1.out .
+blastn -evalue 1e-25 -num_threads 4 -outfmt '6 qseqid staxids bitscore std' -max_target_seqs 1 -max_hsps 1 -out /scratch/dlaetsch/SASA_38126.vs.literature_nucl.mts1.hsp1.out  -query assemblies/SASA_38126.fasta -db literature_nucl/literature_nucl.fna && rsync -avhP /scratch/dlaetsch/SASA_38126.vs.literature_nucl.mts1.hsp1.out .
+blastn -evalue 1e-25 -num_threads 4 -outfmt '6 qseqid staxids bitscore std' -max_target_seqs 1 -max_hsps 1 -out /scratch/dlaetsch/SASA_39248.vs.literature_nucl.mts1.hsp1.out  -query assemblies/SASA_39248.fasta -db literature_nucl/literature_nucl.fna && rsync -avhP /scratch/dlaetsch/SASA_39248.vs.literature_nucl.mts1.hsp1.out .
+blastn -evalue 1e-25 -num_threads 4 -outfmt '6 qseqid staxids bitscore std' -max_target_seqs 1 -max_hsps 1 -out /scratch/dlaetsch/SASA_48316.vs.literature_nucl.mts1.hsp1.out  -query assemblies/SASA_48316.fasta -db literature_nucl/literature_nucl.fna && rsync -avhP /scratch/dlaetsch/SASA_48316.vs.literature_nucl.mts1.hsp1.out .
+blastn -evalue 1e-25 -num_threads 4 -outfmt '6 qseqid staxids bitscore std' -max_target_seqs 1 -max_hsps 1 -out /scratch/dlaetsch/SASA_50290.vs.literature_nucl.mts1.hsp1.out  -query assemblies/SASA_50290.fasta -db literature_nucl/literature_nucl.fna && rsync -avhP /scratch/dlaetsch/SASA_50290.vs.literature_nucl.mts1.hsp1.out .
+blastn -evalue 1e-25 -num_threads 4 -outfmt '6 qseqid staxids bitscore std' -max_target_seqs 1 -max_hsps 1 -out /scratch/dlaetsch/SASA_53035.vs.literature_nucl.mts1.hsp1.out  -query assemblies/SASA_53035.fasta -db literature_nucl/literature_nucl.fna && rsync -avhP /scratch/dlaetsch/SASA_53035.vs.literature_nucl.mts1.hsp1.out .
+blastn -evalue 1e-25 -num_threads 4 -outfmt '6 qseqid staxids bitscore std' -max_target_seqs 1 -max_hsps 1 -out /scratch/dlaetsch/SASA_54939.vs.literature_nucl.mts1.hsp1.out  -query assemblies/SASA_54939.fasta -db literature_nucl/literature_nucl.fna && rsync -avhP /scratch/dlaetsch/SASA_54939.vs.literature_nucl.mts1.hsp1.out .
+blastn -evalue 1e-25 -num_threads 4 -outfmt '6 qseqid staxids bitscore std' -max_target_seqs 1 -max_hsps 1 -out /scratch/dlaetsch/SASA_55706.vs.literature_nucl.mts1.hsp1.out  -query assemblies/SASA_55706.fasta -db literature_nucl/literature_nucl.fna && rsync -avhP /scratch/dlaetsch/SASA_55706.vs.literature_nucl.mts1.hsp1.out .
+blastn -evalue 1e-25 -num_threads 4 -outfmt '6 qseqid staxids bitscore std' -max_target_seqs 1 -max_hsps 1 -out /scratch/dlaetsch/SASA_56281.vs.literature_nucl.mts1.hsp1.out  -query assemblies/SASA_56281.fasta -db literature_nucl/literature_nucl.fna && rsync -avhP /scratch/dlaetsch/SASA_56281.vs.literature_nucl.mts1.hsp1.out .
+blastn -evalue 1e-25 -num_threads 4 -outfmt '6 qseqid staxids bitscore std' -max_target_seqs 1 -max_hsps 1 -out /scratch/dlaetsch/SASA_57276.vs.literature_nucl.mts1.hsp1.out  -query assemblies/SASA_57276.fasta -db literature_nucl/literature_nucl.fna && rsync -avhP /scratch/dlaetsch/SASA_57276.vs.literature_nucl.mts1.hsp1.out .
+blastn -evalue 1e-25 -num_threads 4 -outfmt '6 qseqid staxids bitscore std' -max_target_seqs 1 -max_hsps 1 -out /scratch/dlaetsch/10133FT0001.vs.nt.mts1.hsp1.out -query assemblies/10133FT0001.fasta -db /exports/blast_db/ncbi.2017-06-13/nt && rsync -avhP /scratch/dlaetsch/10133FT0001.vs.nt.mts1.hsp1.out .
+blastn -evalue 1e-25 -num_threads 4 -outfmt '6 qseqid staxids bitscore std' -max_target_seqs 1 -max_hsps 1 -out /scratch/dlaetsch/10133FT0002.vs.nt.mts1.hsp1.out -query assemblies/10133FT0002.fasta -db /exports/blast_db/ncbi.2017-06-13/nt && rsync -avhP /scratch/dlaetsch/10133FT0002.vs.nt.mts1.hsp1.out .
+blastn -evalue 1e-25 -num_threads 4 -outfmt '6 qseqid staxids bitscore std' -max_target_seqs 1 -max_hsps 1 -out /scratch/dlaetsch/10133FT0003.vs.nt.mts1.hsp1.out -query assemblies/10133FT0003.fasta -db /exports/blast_db/ncbi.2017-06-13/nt && rsync -avhP /scratch/dlaetsch/10133FT0003.vs.nt.mts1.hsp1.out .
+blastn -evalue 1e-25 -num_threads 4 -outfmt '6 qseqid staxids bitscore std' -max_target_seqs 1 -max_hsps 1 -out /scratch/dlaetsch/10133FT0004.vs.nt.mts1.hsp1.out -query assemblies/10133FT0004.fasta -db /exports/blast_db/ncbi.2017-06-13/nt && rsync -avhP /scratch/dlaetsch/10133FT0004.vs.nt.mts1.hsp1.out .
+blastn -evalue 1e-25 -num_threads 4 -outfmt '6 qseqid staxids bitscore std' -max_target_seqs 1 -max_hsps 1 -out /scratch/dlaetsch/10146FT0010.vs.nt.mts1.hsp1.out -query assemblies/10146FT0010.fasta -db /exports/blast_db/ncbi.2017-06-13/nt && rsync -avhP /scratch/dlaetsch/10146FT0010.vs.nt.mts1.hsp1.out .
+blastn -evalue 1e-25 -num_threads 4 -outfmt '6 qseqid staxids bitscore std' -max_target_seqs 1 -max_hsps 1 -out /scratch/dlaetsch/10146FT0011.vs.nt.mts1.hsp1.out -query assemblies/10146FT0011.fasta -db /exports/blast_db/ncbi.2017-06-13/nt && rsync -avhP /scratch/dlaetsch/10146FT0011.vs.nt.mts1.hsp1.out .
+blastn -evalue 1e-25 -num_threads 4 -outfmt '6 qseqid staxids bitscore std' -max_target_seqs 1 -max_hsps 1 -out /scratch/dlaetsch/10146FT0012.vs.nt.mts1.hsp1.out -query assemblies/10146FT0012.fasta -db /exports/blast_db/ncbi.2017-06-13/nt && rsync -avhP /scratch/dlaetsch/10146FT0012.vs.nt.mts1.hsp1.out .
+blastn -evalue 1e-25 -num_threads 4 -outfmt '6 qseqid staxids bitscore std' -max_target_seqs 1 -max_hsps 1 -out /scratch/dlaetsch/10146FT0013.vs.nt.mts1.hsp1.out -query assemblies/10146FT0013.fasta -db /exports/blast_db/ncbi.2017-06-13/nt && rsync -avhP /scratch/dlaetsch/10146FT0013.vs.nt.mts1.hsp1.out .
+blastn -evalue 1e-25 -num_threads 4 -outfmt '6 qseqid staxids bitscore std' -max_target_seqs 1 -max_hsps 1 -out /scratch/dlaetsch/10146FT0014.vs.nt.mts1.hsp1.out -query assemblies/10146FT0014.fasta -db /exports/blast_db/ncbi.2017-06-13/nt && rsync -avhP /scratch/dlaetsch/10146FT0014.vs.nt.mts1.hsp1.out .
+blastn -evalue 1e-25 -num_threads 4 -outfmt '6 qseqid staxids bitscore std' -max_target_seqs 1 -max_hsps 1 -out /scratch/dlaetsch/10146FT0015.vs.nt.mts1.hsp1.out -query assemblies/10146FT0015.fasta -db /exports/blast_db/ncbi.2017-06-13/nt && rsync -avhP /scratch/dlaetsch/10146FT0015.vs.nt.mts1.hsp1.out .
+blastn -evalue 1e-25 -num_threads 4 -outfmt '6 qseqid staxids bitscore std' -max_target_seqs 1 -max_hsps 1 -out /scratch/dlaetsch/10146FT0016.vs.nt.mts1.hsp1.out -query assemblies/10146FT0016.fasta -db /exports/blast_db/ncbi.2017-06-13/nt && rsync -avhP /scratch/dlaetsch/10146FT0016.vs.nt.mts1.hsp1.out .
+blastn -evalue 1e-25 -num_threads 4 -outfmt '6 qseqid staxids bitscore std' -max_target_seqs 1 -max_hsps 1 -out /scratch/dlaetsch/RAS10_1699.vs.nt.mts1.hsp1.out  -query assemblies/RAS10_1699.fasta -db /exports/blast_db/ncbi.2017-06-13/nt && rsync -avhP /scratch/dlaetsch/RAS10_1699.vs.nt.mts1.hsp1.out .
+blastn -evalue 1e-25 -num_threads 4 -outfmt '6 qseqid staxids bitscore std' -max_target_seqs 1 -max_hsps 1 -out /scratch/dlaetsch/RAS10_1767.vs.nt.mts1.hsp1.out  -query assemblies/RAS10_1767.fasta -db /exports/blast_db/ncbi.2017-06-13/nt && rsync -avhP /scratch/dlaetsch/RAS10_1767.vs.nt.mts1.hsp1.out .
+blastn -evalue 1e-25 -num_threads 4 -outfmt '6 qseqid staxids bitscore std' -max_target_seqs 1 -max_hsps 1 -out /scratch/dlaetsch/RAS10_2445.vs.nt.mts1.hsp1.out  -query assemblies/RAS10_2445.fasta -db /exports/blast_db/ncbi.2017-06-13/nt && rsync -avhP /scratch/dlaetsch/RAS10_2445.vs.nt.mts1.hsp1.out .
+blastn -evalue 1e-25 -num_threads 4 -outfmt '6 qseqid staxids bitscore std' -max_target_seqs 1 -max_hsps 1 -out /scratch/dlaetsch/SASA_38126.vs.nt.mts1.hsp1.out  -query assemblies/SASA_38126.fasta -db /exports/blast_db/ncbi.2017-06-13/nt && rsync -avhP /scratch/dlaetsch/SASA_38126.vs.nt.mts1.hsp1.out .
+blastn -evalue 1e-25 -num_threads 4 -outfmt '6 qseqid staxids bitscore std' -max_target_seqs 1 -max_hsps 1 -out /scratch/dlaetsch/SASA_39248.vs.nt.mts1.hsp1.out  -query assemblies/SASA_39248.fasta -db /exports/blast_db/ncbi.2017-06-13/nt && rsync -avhP /scratch/dlaetsch/SASA_39248.vs.nt.mts1.hsp1.out .
+blastn -evalue 1e-25 -num_threads 4 -outfmt '6 qseqid staxids bitscore std' -max_target_seqs 1 -max_hsps 1 -out /scratch/dlaetsch/SASA_48316.vs.nt.mts1.hsp1.out  -query assemblies/SASA_48316.fasta -db /exports/blast_db/ncbi.2017-06-13/nt && rsync -avhP /scratch/dlaetsch/SASA_48316.vs.nt.mts1.hsp1.out .
+blastn -evalue 1e-25 -num_threads 4 -outfmt '6 qseqid staxids bitscore std' -max_target_seqs 1 -max_hsps 1 -out /scratch/dlaetsch/SASA_50290.vs.nt.mts1.hsp1.out  -query assemblies/SASA_50290.fasta -db /exports/blast_db/ncbi.2017-06-13/nt && rsync -avhP /scratch/dlaetsch/SASA_50290.vs.nt.mts1.hsp1.out .
+blastn -evalue 1e-25 -num_threads 4 -outfmt '6 qseqid staxids bitscore std' -max_target_seqs 1 -max_hsps 1 -out /scratch/dlaetsch/SASA_53035.vs.nt.mts1.hsp1.out  -query assemblies/SASA_53035.fasta -db /exports/blast_db/ncbi.2017-06-13/nt && rsync -avhP /scratch/dlaetsch/SASA_53035.vs.nt.mts1.hsp1.out .
+blastn -evalue 1e-25 -num_threads 4 -outfmt '6 qseqid staxids bitscore std' -max_target_seqs 1 -max_hsps 1 -out /scratch/dlaetsch/SASA_54939.vs.nt.mts1.hsp1.out  -query assemblies/SASA_54939.fasta -db /exports/blast_db/ncbi.2017-06-13/nt && rsync -avhP /scratch/dlaetsch/SASA_54939.vs.nt.mts1.hsp1.out .
+blastn -evalue 1e-25 -num_threads 4 -outfmt '6 qseqid staxids bitscore std' -max_target_seqs 1 -max_hsps 1 -out /scratch/dlaetsch/SASA_55706.vs.nt.mts1.hsp1.out  -query assemblies/SASA_55706.fasta -db /exports/blast_db/ncbi.2017-06-13/nt && rsync -avhP /scratch/dlaetsch/SASA_55706.vs.nt.mts1.hsp1.out .
+blastn -evalue 1e-25 -num_threads 4 -outfmt '6 qseqid staxids bitscore std' -max_target_seqs 1 -max_hsps 1 -out /scratch/dlaetsch/SASA_56281.vs.nt.mts1.hsp1.out  -query assemblies/SASA_56281.fasta -db /exports/blast_db/ncbi.2017-06-13/nt && rsync -avhP /scratch/dlaetsch/SASA_56281.vs.nt.mts1.hsp1.out .
+blastn -evalue 1e-25 -num_threads 4 -outfmt '6 qseqid staxids bitscore std' -max_target_seqs 1 -max_hsps 1 -out /scratch/dlaetsch/SASA_57276.vs.nt.mts1.hsp1.out  -query assemblies/SASA_57276.fasta -db /exports/blast_db/ncbi.2017-06-13/nt && rsync -avhP /scratch/dlaetsch/SASA_57276.vs.nt.mts1.hsp1.out .
+
+# taxify
+parallel -j 8 '/exports/software/blobtools/blobtools taxify -f {} -m /data/projects/thesis_dlaetsch/analyses/_bees/literature_prot/literature_prot.taxids -s 0 -t 1' ::: *.vs.literature_prot.mts1.hsp1.out
+parallel -j 8 '/exports/software/blobtools/blobtools taxify -f {} -a 0 -b 4 -c 2 -m /data/projects/thesis_dlaetsch/analyses/_bees/literature_nucl/literature_nucl.taxids -s 0 -t 1' ::: *.vs.literature_nucl.mts1.hsp1.out
+parallel -j8 '/exports/software/blobtools/blobtools taxify -f {} -m /exports/blast_db/uniprot/Reference_Proteomes_2017_07/uniprot_ref_proteomes.taxids -s 0 -t 1' ::: *.vs.refprot.mts1.hsp1.out
+
+
+
+/exports/software/blobtools/blobtools create -i assemblies/10133FT0001.fasta -c assemblies/10133FT0001.bam.cov -t blast/10133FT0001.vs.literature_nucl.mts1.hsp1.taxified.out -t blast/10133FT0001.vs.literature_prot.mts1.hsp1.taxified.out -t blast/10133FT0001.vs.nt.mts1.hsp1.out -t blast/10133FT0001.vs.refprot.mts1.hsp1.taxified.out -o 10133FT0001
+/exports/software/blobtools/blobtools create -i assemblies/10133FT0002.fasta -c assemblies/10133FT0002.bam.cov -t blast/10133FT0002.vs.literature_nucl.mts1.hsp1.taxified.out -t blast/10133FT0002.vs.literature_prot.mts1.hsp1.taxified.out -t blast/10133FT0002.vs.nt.mts1.hsp1.out -t blast/10133FT0002.vs.refprot.mts1.hsp1.taxified.out -o 10133FT0002
+/exports/software/blobtools/blobtools create -i assemblies/10133FT0003.fasta -c assemblies/10133FT0003.bam.cov -t blast/10133FT0003.vs.literature_nucl.mts1.hsp1.taxified.out -t blast/10133FT0003.vs.literature_prot.mts1.hsp1.taxified.out -t blast/10133FT0003.vs.nt.mts1.hsp1.out -t blast/10133FT0003.vs.refprot.mts1.hsp1.taxified.out -o 10133FT0003
+/exports/software/blobtools/blobtools create -i assemblies/10133FT0004.fasta -c assemblies/10133FT0004.bam.cov -t blast/10133FT0004.vs.literature_nucl.mts1.hsp1.taxified.out -t blast/10133FT0004.vs.literature_prot.mts1.hsp1.taxified.out -t blast/10133FT0004.vs.nt.mts1.hsp1.out -t blast/10133FT0004.vs.refprot.mts1.hsp1.taxified.out -o 10133FT0004
+/exports/software/blobtools/blobtools create -i assemblies/10146FT0010.fasta -c assemblies/10146FT0010.bam.cov -t blast/10146FT0010.vs.literature_nucl.mts1.hsp1.taxified.out -t blast/10146FT0010.vs.literature_prot.mts1.hsp1.taxified.out -t blast/10146FT0010.vs.nt.mts1.hsp1.out -t blast/10146FT0010.vs.refprot.mts1.hsp1.taxified.out -o 10146FT0010
+/exports/software/blobtools/blobtools create -i assemblies/10146FT0011.fasta -c assemblies/10146FT0011.bam.cov -t blast/10146FT0011.vs.literature_nucl.mts1.hsp1.taxified.out -t blast/10146FT0011.vs.literature_prot.mts1.hsp1.taxified.out -t blast/10146FT0011.vs.nt.mts1.hsp1.out -t blast/10146FT0011.vs.refprot.mts1.hsp1.taxified.out -o 10146FT0011
+/exports/software/blobtools/blobtools create -i assemblies/10146FT0012.fasta -c assemblies/10146FT0012.bam.cov -t blast/10146FT0012.vs.literature_nucl.mts1.hsp1.taxified.out -t blast/10146FT0012.vs.literature_prot.mts1.hsp1.taxified.out -t blast/10146FT0012.vs.nt.mts1.hsp1.out -t blast/10146FT0012.vs.refprot.mts1.hsp1.taxified.out -o 10146FT0012
+/exports/software/blobtools/blobtools create -i assemblies/10146FT0013.fasta -c assemblies/10146FT0013.bam.cov -t blast/10146FT0013.vs.literature_nucl.mts1.hsp1.taxified.out -t blast/10146FT0013.vs.literature_prot.mts1.hsp1.taxified.out -t blast/10146FT0013.vs.nt.mts1.hsp1.out -t blast/10146FT0013.vs.refprot.mts1.hsp1.taxified.out -o 10146FT0013
+/exports/software/blobtools/blobtools create -i assemblies/10146FT0014.fasta -c assemblies/10146FT0014.bam.cov -t blast/10146FT0014.vs.literature_nucl.mts1.hsp1.taxified.out -t blast/10146FT0014.vs.literature_prot.mts1.hsp1.taxified.out -t blast/10146FT0014.vs.nt.mts1.hsp1.out -t blast/10146FT0014.vs.refprot.mts1.hsp1.taxified.out -o 10146FT0014
+/exports/software/blobtools/blobtools create -i assemblies/10146FT0015.fasta -c assemblies/10146FT0015.bam.cov -t blast/10146FT0015.vs.literature_nucl.mts1.hsp1.taxified.out -t blast/10146FT0015.vs.literature_prot.mts1.hsp1.taxified.out -t blast/10146FT0015.vs.nt.mts1.hsp1.out -t blast/10146FT0015.vs.refprot.mts1.hsp1.taxified.out -o 10146FT0015
+/exports/software/blobtools/blobtools create -i assemblies/10146FT0016.fasta -c assemblies/10146FT0016.bam.cov -t blast/10146FT0016.vs.literature_nucl.mts1.hsp1.taxified.out -t blast/10146FT0016.vs.literature_prot.mts1.hsp1.taxified.out -t blast/10146FT0016.vs.nt.mts1.hsp1.out -t blast/10146FT0016.vs.refprot.mts1.hsp1.taxified.out -o 10146FT0016
+/exports/software/blobtools/blobtools create -i assemblies/RAS10_1699.fasta -c assemblies/RAS10_1699.bam.cov -t blast/RAS10_1699.vs.literature_nucl.mts1.hsp1.taxified.out -t blast/RAS10_1699.vs.literature_prot.mts1.hsp1.taxified.out -t blast/RAS10_1699.vs.nt.mts1.hsp1.out -t blast/RAS10_1699.vs.refprot.mts1.hsp1.taxified.out -o RAS10_1699
+/exports/software/blobtools/blobtools create -i assemblies/RAS10_1767.fasta -c assemblies/RAS10_1767.bam.cov -t blast/RAS10_1767.vs.literature_nucl.mts1.hsp1.taxified.out -t blast/RAS10_1767.vs.literature_prot.mts1.hsp1.taxified.out -t blast/RAS10_1767.vs.nt.mts1.hsp1.out -t blast/RAS10_1767.vs.refprot.mts1.hsp1.taxified.out -o RAS10_1767
+/exports/software/blobtools/blobtools create -i assemblies/RAS10_2445.fasta -c assemblies/RAS10_2445.bam.cov -t blast/RAS10_2445.vs.literature_nucl.mts1.hsp1.taxified.out -t blast/RAS10_2445.vs.literature_prot.mts1.hsp1.taxified.out -t blast/RAS10_2445.vs.nt.mts1.hsp1.out -t blast/RAS10_2445.vs.refprot.mts1.hsp1.taxified.out -o RAS10_2445
+/exports/software/blobtools/blobtools create -i assemblies/SASA_38126.fasta -c assemblies/SASA_38126.bam.cov -t blast/SASA_38126.vs.literature_nucl.mts1.hsp1.taxified.out -t blast/SASA_38126.vs.literature_prot.mts1.hsp1.taxified.out -t blast/SASA_38126.vs.nt.mts1.hsp1.out -t blast/SASA_38126.vs.refprot.mts1.hsp1.taxified.out -o SASA_38126
+/exports/software/blobtools/blobtools create -i assemblies/SASA_39248.fasta -c assemblies/SASA_39248.bam.cov -t blast/SASA_39248.vs.literature_nucl.mts1.hsp1.taxified.out -t blast/SASA_39248.vs.literature_prot.mts1.hsp1.taxified.out -t blast/SASA_39248.vs.nt.mts1.hsp1.out -t blast/SASA_39248.vs.refprot.mts1.hsp1.taxified.out -o SASA_39248
+/exports/software/blobtools/blobtools create -i assemblies/SASA_48316.fasta -c assemblies/SASA_48316.bam.cov -t blast/SASA_48316.vs.literature_nucl.mts1.hsp1.taxified.out -t blast/SASA_48316.vs.literature_prot.mts1.hsp1.taxified.out -t blast/SASA_48316.vs.nt.mts1.hsp1.out -t blast/SASA_48316.vs.refprot.mts1.hsp1.taxified.out -o SASA_48316
+/exports/software/blobtools/blobtools create -i assemblies/SASA_50290.fasta -c assemblies/SASA_50290.bam.cov -t blast/SASA_50290.vs.literature_nucl.mts1.hsp1.taxified.out -t blast/SASA_50290.vs.literature_prot.mts1.hsp1.taxified.out -t blast/SASA_50290.vs.nt.mts1.hsp1.out -t blast/SASA_50290.vs.refprot.mts1.hsp1.taxified.out -o SASA_50290
+/exports/software/blobtools/blobtools create -i assemblies/SASA_53035.fasta -c assemblies/SASA_53035.bam.cov -t blast/SASA_53035.vs.literature_nucl.mts1.hsp1.taxified.out -t blast/SASA_53035.vs.literature_prot.mts1.hsp1.taxified.out -t blast/SASA_53035.vs.nt.mts1.hsp1.out -t blast/SASA_53035.vs.refprot.mts1.hsp1.taxified.out -o SASA_53035
+/exports/software/blobtools/blobtools create -i assemblies/SASA_54939.fasta -c assemblies/SASA_54939.bam.cov -t blast/SASA_54939.vs.literature_nucl.mts1.hsp1.taxified.out -t blast/SASA_54939.vs.literature_prot.mts1.hsp1.taxified.out -t blast/SASA_54939.vs.nt.mts1.hsp1.out -t blast/SASA_54939.vs.refprot.mts1.hsp1.taxified.out -o SASA_54939
+/exports/software/blobtools/blobtools create -i assemblies/SASA_55706.fasta -c assemblies/SASA_55706.bam.cov -t blast/SASA_55706.vs.literature_nucl.mts1.hsp1.taxified.out -t blast/SASA_55706.vs.literature_prot.mts1.hsp1.taxified.out -t blast/SASA_55706.vs.nt.mts1.hsp1.out -t blast/SASA_55706.vs.refprot.mts1.hsp1.taxified.out -o SASA_55706
+/exports/software/blobtools/blobtools create -i assemblies/SASA_56281.fasta -c assemblies/SASA_56281.bam.cov -t blast/SASA_56281.vs.literature_nucl.mts1.hsp1.taxified.out -t blast/SASA_56281.vs.literature_prot.mts1.hsp1.taxified.out -t blast/SASA_56281.vs.nt.mts1.hsp1.out -t blast/SASA_56281.vs.refprot.mts1.hsp1.taxified.out -o SASA_56281
+/exports/software/blobtools/blobtools create -i assemblies/SASA_57276.fasta -c assemblies/SASA_57276.bam.cov -t blast/SASA_57276.vs.literature_nucl.mts1.hsp1.taxified.out -t blast/SASA_57276.vs.literature_prot.mts1.hsp1.taxified.out -t blast/SASA_57276.vs.nt.mts1.hsp1.out -t blast/SASA_57276.vs.refprot.mts1.hsp1.taxified.out -o SASA_57276
+
+/exports/software/blobtools/blobtools view -i 10133FT0001.blobDB.json -x bestsumorder -r all --hits
+/exports/software/blobtools/blobtools view -i 10133FT0001.blobDB.json -x bestsum -r all --hits
+/exports/software/blobtools/blobtools view -i 10133FT0002.blobDB.json -x bestsumorder -r all --hits
+/exports/software/blobtools/blobtools view -i 10133FT0002.blobDB.json -x bestsum -r all --hits
+/exports/software/blobtools/blobtools view -i 10133FT0003.blobDB.json -x bestsumorder -r all --hits
+/exports/software/blobtools/blobtools view -i 10133FT0003.blobDB.json -x bestsum -r all --hits
+/exports/software/blobtools/blobtools view -i 10133FT0004.blobDB.json -x bestsumorder -r all --hits
+/exports/software/blobtools/blobtools view -i 10133FT0004.blobDB.json -x bestsum -r all --hits
+/exports/software/blobtools/blobtools view -i 10146FT0010.blobDB.json -x bestsumorder -r all --hits
+/exports/software/blobtools/blobtools view -i 10146FT0010.blobDB.json -x bestsum -r all --hits
+/exports/software/blobtools/blobtools view -i 10146FT0011.blobDB.json -x bestsumorder -r all --hits
+/exports/software/blobtools/blobtools view -i 10146FT0011.blobDB.json -x bestsum -r all --hits
+/exports/software/blobtools/blobtools view -i 10146FT0012.blobDB.json -x bestsumorder -r all --hits
+/exports/software/blobtools/blobtools view -i 10146FT0012.blobDB.json -x bestsum -r all --hits
+/exports/software/blobtools/blobtools view -i 10146FT0013.blobDB.json -x bestsumorder -r all --hits
+/exports/software/blobtools/blobtools view -i 10146FT0013.blobDB.json -x bestsum -r all --hits
+/exports/software/blobtools/blobtools view -i 10146FT0014.blobDB.json -x bestsumorder -r all --hits
+/exports/software/blobtools/blobtools view -i 10146FT0014.blobDB.json -x bestsum -r all --hits
+/exports/software/blobtools/blobtools view -i 10146FT0015.blobDB.json -x bestsumorder -r all --hits
+/exports/software/blobtools/blobtools view -i 10146FT0015.blobDB.json -x bestsum -r all --hits
+/exports/software/blobtools/blobtools view -i 10146FT0016.blobDB.json -x bestsumorder -r all --hits
+/exports/software/blobtools/blobtools view -i 10146FT0016.blobDB.json -x bestsum -r all --hits
+/exports/software/blobtools/blobtools view -i RAS10_1699.blobDB.json -x bestsumorder -r all --hits
+/exports/software/blobtools/blobtools view -i RAS10_1699.blobDB.json -x bestsum -r all --hits
+/exports/software/blobtools/blobtools view -i RAS10_1767.blobDB.json -x bestsumorder -r all --hits
+/exports/software/blobtools/blobtools view -i RAS10_1767.blobDB.json -x bestsum -r all --hits
+/exports/software/blobtools/blobtools view -i RAS10_2445.blobDB.json -x bestsumorder -r all --hits
+/exports/software/blobtools/blobtools view -i RAS10_2445.blobDB.json -x bestsum -r all --hits
+/exports/software/blobtools/blobtools view -i SASA_38126.blobDB.json -x bestsumorder -r all --hits
+/exports/software/blobtools/blobtools view -i SASA_38126.blobDB.json -x bestsum -r all --hits
+/exports/software/blobtools/blobtools view -i SASA_39248.blobDB.json -x bestsumorder -r all --hits
+/exports/software/blobtools/blobtools view -i SASA_39248.blobDB.json -x bestsum -r all --hits
+/exports/software/blobtools/blobtools view -i SASA_48316.blobDB.json -x bestsumorder -r all --hits
+/exports/software/blobtools/blobtools view -i SASA_48316.blobDB.json -x bestsum -r all --hits
+/exports/software/blobtools/blobtools view -i SASA_50290.blobDB.json -x bestsumorder -r all --hits
+/exports/software/blobtools/blobtools view -i SASA_50290.blobDB.json -x bestsum -r all --hits
+/exports/software/blobtools/blobtools view -i SASA_53035.blobDB.json -x bestsumorder -r all --hits
+/exports/software/blobtools/blobtools view -i SASA_53035.blobDB.json -x bestsum -r all --hits
+/exports/software/blobtools/blobtools view -i SASA_54939.blobDB.json -x bestsumorder -r all --hits
+/exports/software/blobtools/blobtools view -i SASA_54939.blobDB.json -x bestsum -r all --hits
+/exports/software/blobtools/blobtools view -i SASA_55706.blobDB.json -x bestsumorder -r all --hits
+/exports/software/blobtools/blobtools view -i SASA_55706.blobDB.json -x bestsum -r all --hits
+/exports/software/blobtools/blobtools view -i SASA_56281.blobDB.json -x bestsumorder -r all --hits
+/exports/software/blobtools/blobtools view -i SASA_56281.blobDB.json -x bestsum -r all --hits
+/exports/software/blobtools/blobtools view -i SASA_57276.blobDB.json -x bestsumorder -r all --hits
+/exports/software/blobtools/blobtools view -i SASA_57276.blobDB.json -x bestsum -r all --hits
+
+mv bestsum.10133FT0001.blobDB.bestsum.table.txt 10133FT0001.blobDB.bestsum.table.txt ; \
+mv bestsum.10133FT0002.blobDB.bestsum.table.txt 10133FT0002.blobDB.bestsum.table.txt ; \
+mv bestsum.10133FT0003.blobDB.bestsum.table.txt 10133FT0003.blobDB.bestsum.table.txt ; \
+mv bestsum.10133FT0004.blobDB.bestsum.table.txt 10133FT0004.blobDB.bestsum.table.txt ; \
+mv bestsum.10146FT0010.blobDB.bestsum.table.txt 10146FT0010.blobDB.bestsum.table.txt ; \
+mv bestsum.10146FT0011.blobDB.bestsum.table.txt 10146FT0011.blobDB.bestsum.table.txt ; \
+mv bestsum.10146FT0012.blobDB.bestsum.table.txt 10146FT0012.blobDB.bestsum.table.txt ; \
+mv bestsum.10146FT0013.blobDB.bestsum.table.txt 10146FT0013.blobDB.bestsum.table.txt ; \
+mv bestsum.10146FT0014.blobDB.bestsum.table.txt 10146FT0014.blobDB.bestsum.table.txt ; \
+mv bestsum.10146FT0015.blobDB.bestsum.table.txt 10146FT0015.blobDB.bestsum.table.txt ; \
+mv bestsum.10146FT0016.blobDB.bestsum.table.txt 10146FT0016.blobDB.bestsum.table.txt ; \
+mv bestsumorder.10133FT0001.blobDB.bestsumorder.table.txt 10133FT0001.blobDB.bestsumorder.table.txt ; \
+mv bestsumorder.10133FT0002.blobDB.bestsumorder.table.txt 10133FT0002.blobDB.bestsumorder.table.txt ; \
+mv bestsumorder.10133FT0003.blobDB.bestsumorder.table.txt 10133FT0003.blobDB.bestsumorder.table.txt ; \
+mv bestsumorder.10133FT0004.blobDB.bestsumorder.table.txt 10133FT0004.blobDB.bestsumorder.table.txt ; \
+mv bestsumorder.10146FT0010.blobDB.bestsumorder.table.txt 10146FT0010.blobDB.bestsumorder.table.txt ; \
+mv bestsumorder.10146FT0011.blobDB.bestsumorder.table.txt 10146FT0011.blobDB.bestsumorder.table.txt ; \
+mv bestsumorder.10146FT0012.blobDB.bestsumorder.table.txt 10146FT0012.blobDB.bestsumorder.table.txt ; \
+mv bestsumorder.10146FT0013.blobDB.bestsumorder.table.txt 10146FT0013.blobDB.bestsumorder.table.txt ; \
+mv bestsumorder.10146FT0014.blobDB.bestsumorder.table.txt 10146FT0014.blobDB.bestsumorder.table.txt ; \
+mv bestsumorder.10146FT0015.blobDB.bestsumorder.table.txt 10146FT0015.blobDB.bestsumorder.table.txt ; \
+mv bestsumorder.10146FT0016.blobDB.bestsumorder.table.txt 10146FT0016.blobDB.bestsumorder.table.txt ; \
+mv bestsumorder.RAS10_1699.blobDB.bestsumorder.table.txt RAS10_1699.blobDB.bestsumorder.table.txt ; \
+mv bestsumorder.RAS10_1767.blobDB.bestsumorder.table.txt RAS10_1767.blobDB.bestsumorder.table.txt ; \
+mv bestsumorder.RAS10_2445.blobDB.bestsumorder.table.txt RAS10_2445.blobDB.bestsumorder.table.txt ; \
+mv bestsumorder.SASA_38126.blobDB.bestsumorder.table.txt SASA_38126.blobDB.bestsumorder.table.txt ; \
+mv bestsumorder.SASA_39248.blobDB.bestsumorder.table.txt SASA_39248.blobDB.bestsumorder.table.txt ; \
+mv bestsumorder.SASA_48316.blobDB.bestsumorder.table.txt SASA_48316.blobDB.bestsumorder.table.txt ; \
+mv bestsumorder.SASA_50290.blobDB.bestsumorder.table.txt SASA_50290.blobDB.bestsumorder.table.txt ; \
+mv bestsumorder.SASA_53035.blobDB.bestsumorder.table.txt SASA_53035.blobDB.bestsumorder.table.txt ; \
+mv bestsumorder.SASA_54939.blobDB.bestsumorder.table.txt SASA_54939.blobDB.bestsumorder.table.txt ; \
+mv bestsumorder.SASA_55706.blobDB.bestsumorder.table.txt SASA_55706.blobDB.bestsumorder.table.txt ; \
+mv bestsumorder.SASA_56281.blobDB.bestsumorder.table.txt SASA_56281.blobDB.bestsumorder.table.txt ; \
+mv bestsumorder.SASA_57276.blobDB.bestsumorder.table.txt SASA_57276.blobDB.bestsumorder.table.txt ; \
+mv bestsum.RAS10_1699.blobDB.bestsum.table.txt RAS10_1699.blobDB.bestsum.table.txt ; \
+mv bestsum.RAS10_1767.blobDB.bestsum.table.txt RAS10_1767.blobDB.bestsum.table.txt ; \
+mv bestsum.RAS10_2445.blobDB.bestsum.table.txt RAS10_2445.blobDB.bestsum.table.txt ; \
+mv bestsum.SASA_38126.blobDB.bestsum.table.txt SASA_38126.blobDB.bestsum.table.txt ; \
+mv bestsum.SASA_39248.blobDB.bestsum.table.txt SASA_39248.blobDB.bestsum.table.txt ; \
+mv bestsum.SASA_48316.blobDB.bestsum.table.txt SASA_48316.blobDB.bestsum.table.txt ; \
+mv bestsum.SASA_50290.blobDB.bestsum.table.txt SASA_50290.blobDB.bestsum.table.txt ; \
+mv bestsum.SASA_53035.blobDB.bestsum.table.txt SASA_53035.blobDB.bestsum.table.txt ; \
+mv bestsum.SASA_54939.blobDB.bestsum.table.txt SASA_54939.blobDB.bestsum.table.txt ; \
+mv bestsum.SASA_55706.blobDB.bestsum.table.txt SASA_55706.blobDB.bestsum.table.txt ; \
+mv bestsum.SASA_56281.blobDB.bestsum.table.txt SASA_56281.blobDB.bestsum.table.txt ; \
+mv bestsum.SASA_57276.blobDB.bestsum.table.txt SASA_57276.blobDB.bestsum.table.txt
+
+#############################################################################
+
+HB mop/bar
+
+cut -f1,2 -d "|" HB_Bar_v2016.1.fasta | sed 's/gi|//g' > HB_Bar_v2016.1.sane.fasta
+cut -f1,2 -d "|" HB_Mop_v2016.1.fasta | sed 's/gi|//g' > HB_Mop_v2016.1.sane.fasta
+makeblastdb -dbtype nucl -in HB_Bar_v2016.1.sane.fasta
+makeblastdb -dbtype nucl -in HB_Mop_v2016.1.sane.fasta
+
+/data/projects/thesis_dlaetsch/analyses/_bees/holobee/HB_Mop_v2016.1.sane.fasta
+
+
+/exports/software/diamond/diamond-v0.9.5/diamond blastx --max-hsps 1 --sensitive --evalue 1e-25 --threads 16 --max-target-seqs 1 --outfmt 6 --tmpdir /scratch/dlaetsch/ --out 0_assembly/All_contigs.vs.refprot.mts1.hsp1.out --db /exports/blast_db/uniprot/Reference_Proteomes_2017_07/uniprot_ref_proteomes.diamond-v0.9.5.fasta.dmnd --query 0_assembly/All_contigs.fasta
+/exports/software/diamond/diamond-v0.9.5/diamond blastx --max-hsps 1 --sensitive --evalue 1e-25 --threads 16 --max-target-seqs 1 --outfmt 6 --tmpdir /scratch/dlaetsch/ --out 0_assembly/All_contigs.vs.literature_prot.mts1.hsp1.out --db literature_prot/literature_prot.diamond-v0.9.5.dmnd --query 0_assembly/All_contigs.fasta
+blastn -evalue 1e-25 -num_threads 16 -outfmt '6 qseqid staxids bitscore std' -max_target_seqs 1 -max_hsps 1 -out /scratch/dlaetsch/All_contigs.vs.literature_nucl.mts1.hsp1.out  -query 0_assembly/All_contigs.fasta -db literature_nucl/literature_nucl.fna && rsync -avhP /scratch/dlaetsch/All_contigs.vs.literature_nucl.mts1.hsp1.out .
+blastn -evalue 1e-25 -num_threads 16 -outfmt '6 qseqid staxids bitscore std' -max_target_seqs 1 -max_hsps 1 -out /scratch/dlaetsch/All_contigs.vs.nt.mts1.hsp1.out -query 0_assembly/All_contigs.fasta -db /exports/blast_db/ncbi.2017-06-13/nt && rsync -avhP /scratch/dlaetsch/All_contigs.vs.nt.mts1.hsp1.out .
+blastn -evalue 1e-25 -num_threads 16 -outfmt '6 qseqid staxids bitscore std' -max_target_seqs 1 -max_hsps 1 -out /scratch/dlaetsch/All_contigs.vs.HB_Bar_v2016.1.mts1.hsp1.out -query 0_assembly/All_contigs.fasta -db /data/projects/thesis_dlaetsch/analyses/_bees/holobee/HB_Bar_v2016.1.sane.fasta && rsync -avhP /scratch/dlaetsch/All_contigs.vs.HB_Bar_v2016.1.mts1.hsp1.out .
+blastn -evalue 1e-25 -num_threads 16 -outfmt '6 qseqid staxids bitscore std' -max_target_seqs 1 -max_hsps 1 -out /scratch/dlaetsch/All_contigs.vs.HB_Mop_v2016.1.mts1.hsp1.out -query 0_assembly/All_contigs.fasta -db /data/projects/thesis_dlaetsch/analyses/_bees/holobee/HB_Mop_v2016.1.sane.fasta && rsync -avhP /scratch/dlaetsch/All_contigs.vs.HB_Mop_v2016.1.mts1.hsp1.out .
+
+# taxify
+parallel -j 8 '/exports/software/blobtools/blobtools taxify -f {} -m /data/projects/thesis_dlaetsch/analyses/_bees/literature_prot/literature_prot.taxids -s 0 -t 1' ::: *.vs.literature_prot.mts1.hsp1.out
+parallel -j 8 '/exports/software/blobtools/blobtools taxify -f {} -a 0 -b 4 -c 2 -m /data/projects/thesis_dlaetsch/analyses/_bees/literature_nucl/literature_nucl.taxids -s 0 -t 1' ::: *.vs.literature_nucl.mts1.hsp1.out
+parallel -j8 '/exports/software/blobtools/blobtools taxify -f {} -m /exports/blast_db/uniprot/Reference_Proteomes_2017_07/uniprot_ref_proteomes.taxids -s 0 -t 1' ::: *.vs.refprot.mts1.hsp1.out
+
+/exports/software/blobtools/blobtools taxify -a 0 -b 4 -f All_contigs.vs.HB_Bar_v2016.1.mts1.hsp1.out -m /data/projects/thesis_dlaetsch/analyses/_bees/holobee/HB_Bar_v2016.1.gi_to_taxid.txt -s 0 -t 1
+/exports/software/blobtools/blobtools taxify -a 0 -b 4 -f All_contigs.vs.HB_Bar_v2016.1.mts1.hsp1.out -m /data/projects/thesis_dlaetsch/analyses/_bees/holobee/HB_Bar_v2016.1.gi_to_taxid.txt -s 0 -t 1
+/data/projects/thesis_dlaetsch/analyses/_bees/holobee
+
+
+########################################################################################################################################
+Create a "taxified" table for each contig based on custom databases
+########################################################################################################################################
+
+~/git/blobtools/blobtools create -i All_contigs.fasta -y spades -t All_contigs.vs.HB_Bar_v2016.1.mts1.hsp1.taxified.out -t All_contigs.vs.HB_Mop_v2016.1.mts1.hsp1.taxified.out -t All_contigs.vs.literature_nucl.mts1.hsp1.taxified.out -t All_contigs.vs.literature_prot.mts1.hsp1.taxified.out -t All_contigs.vs.nt.mts1.hsp1.out -t All_contigs.vs.refprot.mts1.hsp1.taxified.out -o test -x bestsumorder
+
+~/git/blobtools/blobtools view -i test.blobDB.json -x bestsumorder -r all --hits
+
